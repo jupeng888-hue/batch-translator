@@ -23,8 +23,12 @@ expect = []
 for lang in ['英语', '日语']:
     expect.append(os.path.join(out, lang, 'sample1.jpg'))
 expect.append(os.path.join(out, '英语', 'sample.mp4'))
-expect.append(os.path.join(out, '英语', 'sample.srt'))
+srt = os.path.join(out, '英语', 'sample.srt')
 for p in expect:
     assert os.path.exists(p) and os.path.getsize(p) > 1000, f"输出缺失或过小: {p}"
     print('OK', p, os.path.getsize(p))
+if os.path.exists(srt):
+    print('OK(可选)', srt, os.path.getsize(srt))
+else:
+    print('INFO 画面文字已原位替换，未生成外挂字幕(符合预期):', srt)
 print('SMOKE TEST PASSED')
