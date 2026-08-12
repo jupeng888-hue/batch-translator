@@ -1,0 +1,54 @@
+name: Windows Test & Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HUB_DISABLE_XET: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers sentencepiece modelscope huggingface-hub faster-whisper edge-tts rapidocr-onnxruntime opencv-python imageio-ffmpeg pillow pydub numpy requests PySide6 pyinstaller static-ffmpeg
+          pip install demucs --no-deps
+          pip install julius einops lameenc openunmix dora-search sphn --no-deps
+          pip install simple-lama-inpainting arabic-reshaper python-bidi fire --no-deps
+
+      - name: Smoke test (image + video, Chinese paths)
+        run: python ci/smoke_test.py
+
+      - name: Build exe
+        run: |
+          cd translator_app
+          pyinstaller --noconfirm --clean --onefile --windowed ^
+            --name "BatchTranslator" ^
+            --collect-all faster_whisper ^
+            --collect-all ctranslate2 ^
+            --collect-all rapidocr_onnxruntime ^
+            --collect-all demucs ^
+            --collect-all imageio_ffmpeg ^
+            --collect-all simple_lama_inpainting ^
+            --hidden-import sentencepiece ^
+            --hidden-import modelscope ^
+            --hidden-import arabic_reshaper ^
+            --hidden-import bidi ^
+            gui.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BatchTranslator-exe
+          path: translator_app/dist/BatchTranslator.exe
