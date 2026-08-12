@@ -12,6 +12,8 @@ jobs:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
       HF_ENDPOINT: https://hf-mirror.com
       HF_HUB_DISABLE_XET: "1"
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +29,9 @@ jobs:
           pip install demucs --no-deps
           pip install julius einops lameenc openunmix dora-search sphn --no-deps
           pip install simple-lama-inpainting arabic-reshaper python-bidi fire --no-deps
+
+      - name: Check secret presence
+        run: echo "zhipu_key_length=$env:ZHIPU_API_KEY.Length"
 
       - name: Smoke test (image + video, Chinese paths)
         run: python ci/smoke_test.py
