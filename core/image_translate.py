@@ -507,6 +507,10 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 y1 = max(0, int(pts[:, 1].min()) - dilate)
                 x2 = min(w, int(pts[:, 0].max()) + dilate)
                 y2 = min(h, int(pts[:, 1].max()) + dilate)
+                # 彩色标签/装饰边框区域跳过：二抹会误伤标签底色
+                if _detect_label(img_bgr, (max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min())),
+                                         min(w, int(pts[:, 0].max())), min(h, int(pts[:, 1].max())))) is not None:
+                    continue
                 _fg2, _bg2 = _estimate_colors(img_bgr, (x1, y1, x2, y2))
                 _fl2, _bl2 = _luminance(_fg2), _luminance(_bg2)
                 if not ((_fl2 < 110 and _bl2 > 140) or _fl2 > 170):
