@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt, QTimer
 from core.batch import run_batch
 from core.translate_engine import SUPPORTED_TARGETS, _read_config_key, save_config_key
 
-APP_TITLE = "批量翻译工具 v1.5.1（中文 → 14 种主流语言）"
+APP_TITLE = "批量翻译工具 v1.5.2（中文 → 14 种主流语言）"
 
 
 class MainWindow(QMainWindow):

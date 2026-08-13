@@ -317,6 +317,57 @@ def _get_lama(log=print):
     return _LAMA
 
 
+def _detect_label(img_bgr, rect):
+    """检测框内的实心彩色标签（粉/绿/橙等圆角色块）。
+    返回 ((lx1,ly1,lx2,ly2), 标签颜色) 或 None。"""
+    x1, y1, x2, y2 = rect
+    sub = img_bgr[y1:y2, x1:x2]
+    if sub.size == 0:
+        return None
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    sat_mask = (hsv[:, :, 1] > 60).astype(np.uint8)
+    if sat_mask.mean() < 0.2:
+        return None
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(sat_mask, 8)
+    if n <= 1:
+        return None
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    cx, cy, cw, ch, area = stats[i]
+    rh, rw = sub.shape[:2]
+    if cw < rw * 0.6 or ch < rh * 0.5 or area < rw * rh * 0.3:
+        return None  # 标签必须主导整个文字框（排除双色横幅等）
+    if area / max(1, cw * ch) < 0.5:
+        return None  # 不是实心色块
+    col = tuple(int(c) for c in np.median(sub[lab == i].reshape(-1, 3), axis=0))
+    return (x1 + cx, y1 + cy, x1 + cx + cw, y1 + cy + ch), col
+
+
+def _label_stroke_mask(img_bgr, rect, label_col, region_mask):
+    """彩色标签内只抹文字笔画：取与标签色差异大的像素。"""
+    x1, y1, x2, y2 = rect
+    sub = img_bgr[y1:y2, x1:x2]
+    if sub.size == 0:
+        return region_mask
+    d = np.abs(sub.astype(np.float32) - np.array(label_col, dtype=np.float32)).max(axis=2)
+    binary = (d > 70).astype(np.uint8) * 255
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    rh, rw = sub.shape[:2]
+    keep = np.zeros_like(binary)
+    for i in range(1, n):
+        cx, cy, cw, ch, area = stats[i]
+        if area < 6:
+            continue
+        if area > rw * rh * 0.5:
+            continue
+        keep[lab == i] = 255
+    if int(keep.sum()) < 200:
+        return region_mask
+    keep = cv2.dilate(keep, np.ones((11, 11), np.uint8))
+    out = np.zeros_like(region_mask)
+    out[y1:y2, x1:x2] = keep
+    return out
+
+
 def _bg_uniformity(img_bgr, rect, bg_bgr):
     """框内背景均匀度：接近估计背景色的像素占比。"""
     x1, y1, x2, y2 = rect
@@ -358,7 +409,7 @@ def _detect_border(img_bgr, rect):
     return (x1 + bx1, y1 + by1, x1 + bx2, y1 + by2)
 
 
-def _stroke_mask(img_bgr, rect, region_mask):
+def _stroke_mask(img_bgr, rect, region_mask, k=7):
     """在框内按文字颜色提取笔画级 mask：只抹文字笔画，保住装饰边框/底色。
     提取失败（如白字彩底标签）时回退整框 mask。"""
     x1, y1, x2, y2 = rect
@@ -387,7 +438,7 @@ def _stroke_mask(img_bgr, rect, region_mask):
         keep[labels == i] = 255
     if int(keep.sum()) < 300:
         return region_mask  # 提取不到笔画，回退整框
-    keep = cv2.dilate(keep, np.ones((7, 7), np.uint8))
+    keep = cv2.dilate(keep, np.ones((k, k), np.uint8))
     out = np.zeros_like(region_mask)
     out[y1:y2, x1:x2] = keep
     return out
@@ -412,18 +463,37 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
             ux2 = min(w, int(pts[:, 0].max()))
             uy2 = min(h, int(pts[:, 1].max()))
             _fg_e, _bg_e = _estimate_colors(img_bgr, (ux1, uy1, ux2, uy2))
-            dark_on_light = _luminance(_fg_e) < 110 and _luminance(_bg_e) > 140 \
-                and _bg_uniformity(img_bgr, (ux1, uy1, ux2, uy2), _bg_e) >= 0.50
-            if dark_on_light and _detect_border(img_bgr, (ux1, uy1, ux2, uy2)) is not None:
-                # 浅色背景上的深色文字+装饰边框：只抹文字笔画，保住边框
+            fl, bl = _luminance(_fg_e), _luminance(_bg_e)
+            uni = _bg_uniformity(img_bgr, (ux1, uy1, ux2, uy2), _bg_e)
+            sat = int(max(_bg_e)) - int(min(_bg_e))
+            stroke_k = None
+            label = _detect_label(img_bgr, (ux1, uy1, ux2, uy2))
+            if label is not None:
+                # 彩色标签：只抹标签内的文字笔画，标签底色完整保留
+                (lx1, ly1, lx2, ly2), lcol = label
+                box_mask = np.zeros_like(mask)
+                box_mask[ly1:ly2, lx1:lx2] = 255
+                mask |= _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask)
+                continue
+            if uni >= 0.5:
+                if fl < 110 and bl > 140:
+                    stroke_k = 7    # 深字浅底：只抹笔画，边框靠连通域过滤保留
+                elif fl > 170:
+                    stroke_k = 15   # 白字：连阴影/描边一起抹
+            if stroke_k is not None:
                 box_mask = np.zeros_like(mask)
                 box_mask[y1:y2, x1:x2] = 255
-                mask |= _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask)
+                mask |= _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k)
             else:
                 mask[y1:y2, x1:x2] = 255
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        out = lama(Image.fromarray(rgb), Image.fromarray(mask))
-        return cv2.cvtColor(np.array(out), cv2.COLOR_RGB2BGR)
+        out = cv2.cvtColor(np.array(lama(Image.fromarray(rgb), Image.fromarray(mask))), cv2.COLOR_RGB2BGR)
+        # 边缘羽化融合：修复区与原图平滑过渡，消除矩形色块接缝
+        m = mask.astype(np.float32) / 255.0
+        m = cv2.dilate(m, np.ones((13, 13), np.uint8))  # 保证文字区完全不透原图
+        m = cv2.GaussianBlur(m, (0, 0), 8)
+        res = out.astype(np.float32) * m[..., None] + img_bgr.astype(np.float32) * (1.0 - m[..., None])
+        return res.astype(np.uint8)
     except Exception as e:
         log(f"[图片] LaMa 修复失败，回退传统算法：{e}")
         return None
@@ -839,6 +909,22 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
         dark_on_light = _luminance(_fg_b) < 110 and _luminance(_bg_b) > 140 \
             and _bg_uniformity(orig_bgr, rect, _bg_b) >= 0.50
         border = _detect_border(orig_bgr, rect) if dark_on_light else None
+        _label = _detect_label(orig_bgr, rect) if border is None else None
+        if _label is not None:
+            (lx1, ly1, lx2, ly2), _lcol = _label
+            inx = max(3, int((lx2 - lx1) * 0.08))
+            iny = max(2, int((ly2 - ly1) * 0.12))
+            rect = (lx1 + inx, ly1 + iny, lx2 - inx, ly2 - iny)
+            x1, y1, x2, y2 = rect
+            expand = 1.0
+            allow_widen = False
+            # 文字色从标签内部重估：取与标签色差异最大的像素簇（即原文字色）
+            _sub = orig_bgr[y1:y2, x1:x2].reshape(-1, 3).astype(np.float32)
+            if _sub.size:
+                _d = np.abs(_sub - np.array(_lcol, dtype=np.float32)).max(axis=1)
+                _sel = _sub[_d > 70]
+                if len(_sel) >= 10:
+                    fg = tuple(int(c) for c in np.median(_sel, axis=0))
         if border is not None:
             bx1, by1, bx2, by2 = border
             bw_b, bh_b = bx2 - bx1, by2 - by1
