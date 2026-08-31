@@ -192,7 +192,9 @@ def merge_line_boxes(items):
             max_h = max(last["h"], e["h"])
             v_close = abs(e["cy"] - (lr[1] + lr[3]) / 2) < min_h * 0.6
             gap = e["rect"][0] - lr[2]
-            h_close = gap < min_h * 0.6
+            # 只允许向右顺序拼接（同一行内、间距小）；
+            # 按 cy 排序时同行靠左的框会产生负间距，绝不合并（多栏清单会跨栏串行）
+            h_close = -2 <= gap < min_h * 0.6
             similar_h = max_h <= min_h * 1.4
             if v_close and h_close and similar_h:
                 x1 = min(lr[0], e["rect"][0]); y1 = min(lr[1], e["rect"][1])
@@ -222,6 +224,25 @@ def _estimate_colors(img_bgr, rect):
     if len(fg_px) == 0:
         return tuple(int(c) for c in bg), tuple(int(c) for c in bg)
     fg = np.median(fg_px, axis=0)
+    # 文字覆盖率不足 25% 时（宽扁框/多栏合并框），p75 取到的全是背景，
+    # 估计出的"文字色"≈背景色 → 改看差异最大的前 5% 像素簇
+    if int(max(fg) - min(fg)) <= 30 and np.abs(fg - bg).max() <= 30:
+        th0 = np.percentile(dist, 95)
+        fg_px0 = pixels[dist >= th0]
+        if len(fg_px0) >= 10:
+            fg = np.median(fg_px0, axis=0)
+    # 防混色：p75 估计落在中间灰，或亮度接近/高于背景（亮底上不可能有"白字"）时，
+    # 多半是深色笔画+浅色描边/图标混在一起；改看差异最大的前 5% 像素簇，取真正的文字本色
+    _lum = _luminance(fg)
+    _blum = _luminance(bg)
+    if 90 < _lum < 250 and _blum > _lum - 10:
+        th2 = np.percentile(dist, 95)
+        fg_px2 = pixels[dist >= th2]
+        if len(fg_px2) >= 10:
+            fg2 = np.median(fg_px2, axis=0)
+            _lum2 = _luminance(fg2)
+            if _lum2 < 70 or _lum2 > 225 or (_blum > 200 and _lum2 < _lum - 40):
+                fg = fg2
     return tuple(int(c) for c in fg), tuple(int(c) for c in bg)  # BGR
 
 
@@ -342,8 +363,9 @@ def _detect_label(img_bgr, rect):
     return (x1 + cx, y1 + cy, x1 + cx + cw, y1 + cy + ch), col
 
 
-def _label_stroke_mask(img_bgr, rect, label_col, region_mask):
-    """彩色标签内只抹文字笔画：取与标签色差异大的像素。"""
+def _label_stroke_mask(img_bgr, rect, label_col, region_mask, inner=None):
+    """彩色标签内只抹文字笔画：取与标签色差异大的像素。
+    inner 为未膨胀文字框：质心落在框外的连通块（如标签上部的数字/小数点）保留不抹。"""
     x1, y1, x2, y2 = rect
     sub = img_bgr[y1:y2, x1:x2]
     if sub.size == 0:
@@ -359,10 +381,21 @@ def _label_stroke_mask(img_bgr, rect, label_col, region_mask):
             continue
         if area > rw * rh * 0.5:
             continue
+        if inner is not None:
+            _gy = y1 + cy + ch / 2
+            if _gy < inner[1]:
+                continue  # 文字行上方的内容（如标签上部的数字）保留不抹
+        # 圆点状小组件（小数点/句点）保留：笔画组件不会是这么饱满的近似正方形
+        if area <= 150 and 0.5 <= cw / max(1, ch) <= 2.0 and area >= 0.5 * cw * ch:
+            continue
         keep[lab == i] = 255
     if int(keep.sum()) < 200:
         return region_mask
-    keep = cv2.dilate(keep, np.ones((11, 11), np.uint8))
+    keep = cv2.dilate(keep, np.ones((7, 7), np.uint8))
+    if inner is not None:
+        # 裁剪到文字行上缘以下：膨胀晕不许侵入文字行上方（数字/小数点区域）
+        _cut = max(0, inner[1] + 15 - y1)
+        keep[:_cut, :] = 0
     out = np.zeros_like(region_mask)
     out[y1:y2, x1:x2] = keep
     return out
@@ -387,10 +420,16 @@ def _detect_border(img_bgr, rect):
     fg, _ = _estimate_colors(img_bgr, rect)
     fl = _luminance(fg)
     gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
-    if fl < 128:
-        binary = (gray <= min(255, int(fl) + 70)).astype(np.uint8) * 255
-    else:
-        binary = (gray >= max(0, int(fl) - 70)).astype(np.uint8) * 255
+    # 主用 Otsu 自适应阈值（按文字明暗选极性），能完整覆盖渐变/半透明笔画；
+    # 退化（占比过小/过大）时回退固定边距阈值
+    _flag = cv2.THRESH_BINARY_INV if fl < 128 else cv2.THRESH_BINARY
+    _, binary = cv2.threshold(gray, 0, 255, _flag + cv2.THRESH_OTSU)
+    _ratio = float((binary > 0).mean())
+    if _ratio < 0.01 or _ratio > 0.6:
+        if fl < 128:
+            binary = (gray <= min(255, int(fl) + 95)).astype(np.uint8) * 255
+        else:
+            binary = (gray >= max(0, int(fl) - 95)).astype(np.uint8) * 255
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     rh, rw = sub.shape[:2]
     bx1 = by1 = 10 ** 9
@@ -409,20 +448,29 @@ def _detect_border(img_bgr, rect):
     return (x1 + bx1, y1 + by1, x1 + bx2, y1 + by2)
 
 
-def _stroke_mask(img_bgr, rect, region_mask, k=7):
+def _stroke_mask(img_bgr, rect, region_mask, k=7, fg=None, inner=None):
     """在框内按文字颜色提取笔画级 mask：只抹文字笔画，保住装饰边框/底色。
-    提取失败（如白字彩底标签）时回退整框 mask。"""
+    提取失败（如白字彩底标签）时回退整框 mask。
+    fg 可传入按未膨胀框估计的文字色（膨胀区含图标/邻行时重估极易混色误判极性）。
+    inner 为未膨胀框：连通块质心落在 inner 之外（如框上方的图标）一律保留不抹。"""
     x1, y1, x2, y2 = rect
     sub = img_bgr[y1:y2, x1:x2]
     if sub.size == 0:
         return region_mask
-    fg, _ = _estimate_colors(img_bgr, rect)
+    if fg is None:
+        fg, _ = _estimate_colors(img_bgr, rect)
     fl = _luminance(fg)
     gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
-    if fl < 128:
-        binary = (gray <= min(255, int(fl) + 70)).astype(np.uint8) * 255
-    else:
-        binary = (gray >= max(0, int(fl) - 70)).astype(np.uint8) * 255
+    # 主用 Otsu 自适应阈值（按文字明暗选极性），能完整覆盖渐变/半透明笔画；
+    # 退化（占比过小/过大）时回退固定边距阈值
+    _flag = cv2.THRESH_BINARY_INV if fl < 128 else cv2.THRESH_BINARY
+    _, binary = cv2.threshold(gray, 0, 255, _flag + cv2.THRESH_OTSU)
+    _ratio = float((binary > 0).mean())
+    if _ratio < 0.01 or _ratio > 0.6:
+        if fl < 128:
+            binary = (gray <= min(255, int(fl) + 95)).astype(np.uint8) * 255
+        else:
+            binary = (gray >= max(0, int(fl) - 95)).astype(np.uint8) * 255
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     rh, rw = sub.shape[:2]
     keep = np.zeros_like(binary)
@@ -431,12 +479,17 @@ def _stroke_mask(img_bgr, rect, region_mask, k=7):
         if area < 8:
             continue
         fill_ratio = area / max(1, cw * ch)
-        if (cw >= rw * 0.75 or ch >= rh * 0.75) and fill_ratio < 0.45:
-            continue  # 大而稀疏的连通域 = 装饰边框/底框线条，保留不抹
+        if cw >= rw * 0.9 and ch >= rh * 0.85 and fill_ratio < 0.30:
+            continue  # 贴边的细线框 = 装饰边框，保留不抹（文字行虽高但填充率高，不受影响）
         if area > rw * rh * 0.6:
             continue  # 超大块 = 底色区域，保留
+        if inner is not None:
+            # 质心落在未膨胀框之外 = 框外内容（上方图标/邻行文字），保留不抹
+            _gx, _gy = x1 + cx + cw / 2, y1 + cy + ch / 2
+            if not (inner[0] <= _gx <= inner[2] and inner[1] <= _gy <= inner[3]):
+                continue
         keep[labels == i] = 255
-    if int(keep.sum()) < 300:
+    if int((keep > 0).sum()) < 2:
         return region_mask  # 提取不到笔画，回退整框
     keep = cv2.dilate(keep, np.ones((k, k), np.uint8))
     out = np.zeros_like(region_mask)
@@ -452,6 +505,8 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
     try:
         h, w = img_bgr.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
+        _unis = []
+        _flat_fills = []
         for box in boxes:
             pts = np.asarray(box, dtype=np.float64).reshape(-1, 2)
             x1 = max(0, int(pts[:, 0].min()) - dilate)
@@ -473,27 +528,106 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 (lx1, ly1, lx2, ly2), lcol = label
                 box_mask = np.zeros_like(mask)
                 box_mask[ly1:ly2, lx1:lx2] = 255
-                mask |= _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask)
+                mask |= _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask,
+                                           inner=(ux1, uy1, ux2, uy2))
                 continue
             if uni >= 0.5:
                 if fl < 110 and bl > 140:
-                    stroke_k = 7    # 深字浅底：只抹笔画，边框靠连通域过滤保留
+                    stroke_k = 13   # 深字浅底：笔画抹除，膨胀加大盖住半透明残边
                 elif fl > 170:
                     stroke_k = 15   # 白字：连阴影/描边一起抹
+            elif fl > 170 and bl < 140:
+                # 白字压深色照片背景：整块抹除会留污斑，改用笔画抹除
+                stroke_k = 15
             if stroke_k is not None:
+                _unis.append(uni)
                 box_mask = np.zeros_like(mask)
                 box_mask[y1:y2, x1:x2] = 255
-                mask |= _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k)
+                _sm = _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k, fg=_fg_e,
+                                   inner=(ux1, uy1, ux2, uy2))
+                mask |= _sm
+                # 高均匀浅底：LaMa 容易留雾状残影，记下mask稍后按背景色平涂
+                if uni >= 0.65 and _luminance(_bg_e) > 200:
+                    _flat_fills.append((_sm, _bg_e))
             else:
+                _unis.append(uni)
                 mask[y1:y2, x1:x2] = 255
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         out = cv2.cvtColor(np.array(lama(Image.fromarray(rgb), Image.fromarray(mask))), cv2.COLOR_RGB2BGR)
+        out = out[:h, :w]  # SimpleLama 内部会把尺寸对齐到 8 的倍数，裁剪回原尺寸
+        # 二次抹除：照片/渐变背景上 LaMa 可能留下淡淡的笔画回声，
+        # 在修复结果上重新检测一遍残余笔画，有则再抹一次
+        try:
+            mask2 = np.zeros_like(mask)
+            for box in boxes:
+                pts = np.asarray(box, dtype=np.float64).reshape(-1, 2)
+                x1 = max(0, int(pts[:, 0].min()) - dilate)
+                y1 = max(0, int(pts[:, 1].min()) - dilate)
+                x2 = min(w, int(pts[:, 0].max()) + dilate)
+                y2 = min(h, int(pts[:, 1].max()) + dilate)
+                # 彩色标签/装饰边框区域跳过：二抹会误伤标签底色
+                if _detect_label(img_bgr, (max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min())),
+                                         min(w, int(pts[:, 0].max())), min(h, int(pts[:, 1].max())))) is not None:
+                    continue
+                _fg2, _bg2 = _estimate_colors(img_bgr, (x1, y1, x2, y2))
+                _fl2, _bl2 = _luminance(_fg2), _luminance(_bg2)
+                if not ((_fl2 < 110 and _bl2 > 140) or _fl2 > 170):
+                    continue
+                # 残影检测：直接与背景色比亮度（深字找比背景暗的，白字找比背景亮的），
+                # 比在修复结果上重做 Otsu 笔画提取稳定得多（近均匀浅底上 Otsu 阈值漂移大）
+                _reg2 = np.zeros_like(mask)
+                _gray2 = cv2.cvtColor(out[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY).astype(np.int16)
+                # 浅底（>240）残影与底色仅差十几级，阈值收紧到 12 才能抓到
+                _m2 = 12 if _bl2 > 240 else 25
+                if _fl2 < 110:
+                    _echo = (_gray2 < int(_bl2) - _m2).astype(np.uint8) * 255
+                    _k2 = 13
+                else:
+                    _echo = (_gray2 > int(_bl2) + _m2).astype(np.uint8) * 255
+                    _k2 = 15
+                # 滤掉触及区域外缘的连通块（图标/邻行文字等不属于本框残影的内容）
+                _n2, _lab2, _st2, _ = cv2.connectedComponentsWithStats(_echo, 8)
+                _eh, _ew = _echo.shape[:2]
+                _keep2 = np.zeros_like(_echo)
+                for _i in range(1, _n2):
+                    _cx, _cy, _cw, _ch, _ca = _st2[_i]
+                    if _ca < 6:
+                        continue
+                    if _cx <= 1 or _cy <= 1 or _cx + _cw >= _ew - 1 or _cy + _ch >= _eh - 1:
+                        continue  # 贴边 = 框外内容侵入，保留不抹
+                    _keep2[_lab2 == _i] = 255
+                _echo = cv2.dilate(_keep2, np.ones((_k2, _k2), np.uint8))
+                _reg2[y1:y2, x1:x2] = _echo
+                mask2 |= _reg2
+            if int((mask2 > 0).sum()) > 300:
+                rgb2 = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                out = cv2.cvtColor(np.array(lama(Image.fromarray(rgb2), Image.fromarray(mask2))), cv2.COLOR_RGB2BGR)
+                out = out[:h, :w]
+                mask = cv2.bitwise_or(mask, mask2)
+                log("[图片] 检测到笔画残影，已二次抹除")
+        except Exception:
+            pass
+        # 高均匀浅底平涂：LaMa 在这类背景上的填充色总会差几级，直接涂背景色无痕
+        for _fm, _fb in _flat_fills:
+            out[_fm > 0] = _fb
         # 边缘羽化融合：修复区与原图平滑过渡，消除矩形色块接缝
         m = mask.astype(np.float32) / 255.0
         m = cv2.dilate(m, np.ones((13, 13), np.uint8))  # 保证文字区完全不透原图
         m = cv2.GaussianBlur(m, (0, 0), 8)
-        res = out.astype(np.float32) * m[..., None] + img_bgr.astype(np.float32) * (1.0 - m[..., None])
-        return res.astype(np.uint8)
+        # 修复区整体柔化仅在照片类复杂背景下启用（模拟焦外虚化遮 LaMa 色带）；
+        # 浅色均匀背景上启用反而把邻近图标/线条糊成雾斑
+        if _unis and min(_unis) < 0.5:
+            out_soft = cv2.GaussianBlur(out, (0, 0), 5)
+        else:
+            out_soft = out
+        res = out_soft.astype(np.float32) * m[..., None] + img_bgr.astype(np.float32) * (1.0 - m[..., None])
+        res = res.astype(np.uint8)
+        # 高均匀浅底二次定色：羽化环会把原图文字边缘按比例混回形成雾状残影，
+        # 均匀底色上直接把笔画区（含外晕）整体定成背景色，彻底杜绝残影
+        for _fm, _fb in _flat_fills:
+            _core = cv2.dilate((_fm > 0).astype(np.uint8), np.ones((25, 25), np.uint8))
+            res[_core > 0] = _fb
+        return res
     except Exception as e:
         log(f"[图片] LaMa 修复失败，回退传统算法：{e}")
         return None
@@ -668,7 +802,8 @@ def _luminance(bgr):
 
 def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                     left_limit=None, right_limit=None, tight=False, orig_bgr=None,
-                    top_limit=None, bottom_limit=None, allow_widen=True):
+                    top_limit=None, bottom_limit=None, allow_widen=True,
+                    label_mode=False, force_size=None, probe=False):
     """在矩形区域内回填译文：允许水平适度扩展，优先单行、贴近原字号。
     自动加描边（浅色文字配深描边、深色文字配浅描边），提升复杂背景可读性。"""
     x1, y1, x2, y2 = rect
@@ -687,6 +822,8 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
     box_w = ax2 - ax1
 
     text = _shape_for_render(text)
+    # 标签模式：文字必须完整落在标签内，高度余量收紧（多行也不行出标签）
+    h_slack = 1.06 if label_mode else 1.3
     draw = ImageDraw.Draw(img_pil)
     fg_rgb = (fg_bgr[2], fg_bgr[1], fg_bgr[0])
     bold = _estimate_bold(orig_bgr, rect, fg_bgr) if orig_bgr is not None else False
@@ -696,6 +833,9 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
     single = None  # 单行候选：(font, lines, line_h, total_h, size)
     start = max(8, int(box_h * 0.95))
     floor = max(10, int(box_h * 0.30))
+    if force_size is not None:
+        # 同一水平带的文字统一字号（由调用方探测本组最小可行字号后强制指定）
+        start = floor = max(8, int(force_size))
     n_words0 = len(text.split())
     cand = []  # 可行候选（字号从大到小）
     for size in range(start, floor - 1, -1):
@@ -704,10 +844,15 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
         line_h = int((ascent + descent) * 1.12)
         if single is None and draw.textlength(text, font=font) <= box_w:
             single = (font, [text], line_h, line_h, size)
+        # 断词保护：最长单词都放不下的字号直接跳过，宁可更小也不把单词截断
+        if max((draw.textlength(_wd, font=font) for _wd in text.split()), default=0) > box_w:
+            if best is None:
+                best = (font, _wrap_balanced(draw, text, font, box_w), line_h, line_h * 9)
+            continue
         lines = _wrap_balanced(draw, text, font, box_w)
         total_h = line_h * len(lines)
         max_line_w = max((draw.textlength(l, font=font) for l in lines), default=0)
-        if max_line_w <= box_w and total_h <= box_h * 1.3:
+        if max_line_w <= box_w and total_h <= box_h * h_slack:
             cand.append((font, lines, line_h, total_h))
             if not tight or len(cand) >= 6:
                 break
@@ -735,6 +880,17 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                         break
         best = chosen
     font, lines, line_h, total_h = best
+    # 断词兜底：选定字号下最长单词仍超宽时，逐级缩到单词完整放下为止
+    if max((draw.textlength(_wd, font=font) for _wd in text.split()), default=0) > box_w:
+        for _s in range(font.size - 1, 7, -1):
+            _f = _load_font(_s, bold=bold)
+            if max((draw.textlength(_wd, font=_f) for _wd in text.split()), default=0) <= box_w:
+                font = _f
+                lines = _wrap_balanced(draw, text, font, box_w)
+                _a2, _d2 = font.getmetrics()
+                line_h = int((_a2 + _d2) * 1.12)
+                total_h = line_h * len(lines)
+                break
     n_words = len(text.split())
 
     def _orphan_count(ls):
@@ -764,7 +920,7 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                     break
                 ls2 = _wrap_balanced(draw, text, f2, bw2)
                 mw2 = max((draw.textlength(l, font=f2) for l in ls2), default=0)
-                if mw2 <= bw2 and lh2 * len(ls2) <= box_h * 1.3 \
+                if mw2 <= bw2 and lh2 * len(ls2) <= box_h * h_slack \
                         and len(ls2) < len(lines) and _orphan_count(ls2) == 0:
                     improved = (f2, ls2, lh2, lh2 * len(ls2))
                     break
@@ -774,13 +930,20 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
             font, lines, line_h, total_h = improved
             single = None  # 已采用更优方案，不再走单行替换
     # 短句单行优先：一行能放下时尽量不换行；≤4 词的短句放宽字号损失容忍度
-    if single is not None and len(lines) > 1:
+    # 标签模式（彩色小标签）除外：译文长、标签小，强制单行会缩到看不清，
+    # 允许两行换取显著更大的字号
+    if single is not None and len(lines) > 1 and not label_mode:
         s_font, s_lines, s_lh, s_th, s_size = single
         # ≤3 词短句：只要能挤进一行就不断行（字号可降到下限）
         thresh = 0.30 if n_words <= 3 else (0.40 if n_words <= 4 else 0.65)
         # 宽扁标签框（宽>2.2倍高）：多行必然压出框外，小字单行更干净
-        wide_label = box_w >= box_h * 2.2 and s_size >= 11
+        wide_label = box_w >= box_h * 2.2 and s_size >= 12
         if s_size >= font.size * thresh or (wide_label and len(lines) > 1):
+            font, lines, line_h, total_h = s_font, s_lines, s_lh, s_th
+    if label_mode and single is not None and len(lines) > 1:
+        # 单行字号若能达到多行方案的 75%，才用单行；否则保留更大的多行字
+        s_font, s_lines, s_lh, s_th, s_size = single
+        if s_size >= font.size * 0.75:
             font, lines, line_h, total_h = s_font, s_lines, s_lh, s_th
 
     # 最终保险：单行译文宽度不超出原框，避免压到装饰边框/框外区域
@@ -794,6 +957,8 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                     line_h = int((a3 + d3) * 1.12)
                     font, total_h = f3, line_h
                     break
+    if probe:
+        return font.size  # 仅探测字号，不落笔
     # 描边颜色：优先继承原图描边色，否则用与文字亮度反差的中性色
     fg_lum = _luminance(fg_bgr)
     stroke_rgb = (30, 30, 30) if fg_lum > 128 else (240, 240, 240)
@@ -875,6 +1040,9 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
     # 回填
     orig_bgr = img_bgr
     rects = [_box_to_rect(b) for b, _ in keep]
+    # 第一遍：确定每框的落字参数并探测各自可行字号；
+    # 同一水平带（图标行/顶栏等）统一用组内最小字号，避免同排文字大小不一
+    _jobs = []
     for (box, src_text), dst_text, rect, smooth in zip(keep, translations, rects, smooth_flags):
         fg, _bg = _estimate_colors(orig_bgr, rect)
         # 计算左右扩展限制：同一水平带上最近的邻框边缘
@@ -912,8 +1080,8 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
         _label = _detect_label(orig_bgr, rect) if border is None else None
         if _label is not None:
             (lx1, ly1, lx2, ly2), _lcol = _label
-            inx = max(3, int((lx2 - lx1) * 0.08))
-            iny = max(2, int((ly2 - ly1) * 0.12))
+            inx = max(2, int((lx2 - lx1) * 0.05))
+            iny = max(1, int((ly2 - ly1) * 0.06))
             rect = (lx1 + inx, ly1 + iny, lx2 - inx, ly2 - iny)
             x1, y1, x2, y2 = rect
             expand = 1.0
@@ -935,11 +1103,49 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
                 x1, y1, x2, y2 = rect
                 expand = 1.0
                 allow_widen = False
-        img_pil = draw_text_block(img_pil, rect, dst_text, fg, expand=expand,
-                                  left_limit=left_limit, right_limit=right_limit,
+        _size = draw_text_block(img_pil, rect, dst_text, fg, expand=expand,
+                                left_limit=left_limit, right_limit=right_limit,
+                                orig_bgr=orig_bgr, tight=True,
+                                top_limit=top_limit, bottom_limit=bottom_limit,
+                                allow_widen=allow_widen,
+                                label_mode=_label is not None, probe=True)
+        _jobs.append(dict(rect=rect, dst=dst_text, fg=fg, expand=expand,
+                          left_limit=left_limit, right_limit=right_limit,
+                          top_limit=top_limit, bottom_limit=bottom_limit,
+                          allow_widen=allow_widen, label_mode=_label is not None,
+                          size=_size if isinstance(_size, int) else None,
+                          cy=(rect[1] + rect[3]) / 2, bh=rect[3] - rect[1]))
+
+    # 同排统一字号：按纵向中心分组（带高相近），组内取最小可行字号
+    _forced = [None] * len(_jobs)
+    _used = [False] * len(_jobs)
+    for i, a in enumerate(_jobs):
+        if _used[i] or a["size"] is None:
+            continue
+        grp = [i]
+        _used[i] = True
+        for j in range(i + 1, len(_jobs)):
+            b = _jobs[j]
+            if _used[j] or b["size"] is None:
+                continue
+            if abs(b["cy"] - a["cy"]) <= max(a["bh"], b["bh"]) * 0.6 \
+                    and min(a["bh"], b["bh"]) >= max(a["bh"], b["bh"]) * 0.65:
+                grp.append(j)
+                _used[j] = True
+        if len(grp) > 1:
+            _smin = min(_jobs[g]["size"] for g in grp)
+            for g in grp:
+                _forced[g] = _smin
+
+    for j, jb in enumerate(_jobs):
+        img_pil = draw_text_block(img_pil, jb["rect"], jb["dst"], jb["fg"],
+                                  expand=jb["expand"],
+                                  left_limit=jb["left_limit"], right_limit=jb["right_limit"],
                                   orig_bgr=orig_bgr, tight=True,
-                                  top_limit=top_limit, bottom_limit=bottom_limit,
-                                  allow_widen=allow_widen)
+                                  top_limit=jb["top_limit"], bottom_limit=jb["bottom_limit"],
+                                  allow_widen=jb["allow_widen"],
+                                  label_mode=jb["label_mode"],
+                                  force_size=_forced[j])
 
     out_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

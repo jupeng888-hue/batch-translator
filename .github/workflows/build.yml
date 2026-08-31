@@ -53,7 +53,10 @@ jobs:
             --hidden-import bidi `
             gui.py
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: BatchTranslator-exe
-          path: translator_app/dist/BatchTranslator.exe
+      - name: Upload exe to Release v1.7
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create v1.7 --title "批量翻译工具 v1.7" --notes "CI 自动构建：Windows 免安装版，解压即用" || true
+          gh release upload v1.7 translator_app/dist/BatchTranslator.exe --clobber

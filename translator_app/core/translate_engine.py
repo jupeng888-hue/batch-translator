@@ -181,6 +181,44 @@ class _Zhipu:
             out.append(str(x).strip())
         return out
 
+    @staticmethod
+    def _has_cjk(text):
+        return any('\u4e00' <= c <= '\u9fff' for c in text)
+
+    @staticmethod
+    def _strip_cjk(text):
+        import re as _r
+        return _r.sub(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+", " ", text).strip()
+
+    _SCRIPT_RANGES = {
+        "ru": ('\u0400', '\u04ff'), "ar": ('\u0600', '\u06ff'),
+        "th": ('\u0e00', '\u0e7f'), "hi": ('\u0900', '\u097f'),
+        "el": ('\u0370', '\u03ff'), "he": ('\u0590', '\u05ff'),
+        "ko": ('\uac00', '\ud7af'), "ja": ('\u3040', '\u30ff'),
+    }
+
+    def _lang_suspect(self, arr, target):
+        """目标语种有独立文字体系时，整批译文一个该文字体系的字符都没有 = 模型答错语种。"""
+        rng = self._SCRIPT_RANGES.get(target)
+        if not rng:
+            return False
+        joined = "".join(arr)
+        return not any(rng[0] <= c <= rng[1] for c in joined)
+
+    def _hygiene(self, out, target):
+        """非中日韩目标语种的译文不允许残留中文字符；残留则尝试剔除。"""
+        if target in ("zh", "ja", "ko"):
+            return out
+        fixed = []
+        for t in out:
+            if self._has_cjk(t):
+                t2 = self._strip_cjk(t)
+                self.log(f"[翻译] 译文含中文残留，已剔除: {t!r} -> {t2!r}")
+                fixed.append(t2 if t2 else t)
+            else:
+                fixed.append(t)
+        return fixed
+
     def translate(self, texts, target, image_path=None, timeout=90):
         """texts: 中文短语列表。image_path 提供时走 GLM-4V 看图理解语境。"""
         import json as _json, base64 as _b64
@@ -213,18 +251,28 @@ class _Zhipu:
                              "image_url": {"url": f"data:image/{img_ext};base64,{b64}"}},
                             {"type": "text",
                              "text": "这些是图中识别出的文字，结合图片语境翻译。\n" + user_text}]}]
-            for _ in range(2):
+            for _ in range(3):
                 try:
-                    return self._parse_array(self._chat(messages, "glm-4v-flash", timeout), len(texts))
+                    arr = self._parse_array(self._chat(messages, "glm-4v-flash", timeout), len(texts))
+                    if target not in ("zh", "ja", "ko") and any(self._has_cjk(x) for x in arr):
+                        raise ValueError("译文混入中文，重试")
+                    if self._lang_suspect(arr, target):
+                        raise ValueError("译文非目标语种，重试")
+                    return self._hygiene(arr, target)
                 except Exception as e:
                     self.log(f"[翻译] GLM-4V 批量重试：{e}")
             # 4V 批量不行则转纯文本批量
         messages = [{"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_text + "\n\n注意：输出数组必须有且只有 "
                      + str(len(texts)) + " 个元素，与输入一一对应。"}]
-        for _ in range(2):
+        for _ in range(3):
             try:
-                return self._parse_array(self._chat(messages, "glm-4-flash", timeout), len(texts))
+                arr = self._parse_array(self._chat(messages, "glm-4-flash", timeout), len(texts))
+                if target not in ("zh", "ja", "ko") and any(self._has_cjk(x) for x in arr):
+                    raise ValueError("译文混入中文，重试")
+                if self._lang_suspect(arr, target):
+                    raise ValueError("译文非目标语种，重试")
+                return self._hygiene(arr, target)
             except Exception as e:
                 self.log(f"[翻译] GLM 批量重试：{e}")
         # 逐条兜底
@@ -233,8 +281,12 @@ class _Zhipu:
             for t in texts:
                 m2 = [{"role": "system", "content": sys_prompt},
                       {"role": "user", "content": "待翻译中文列表：\n" + _json.dumps([t], ensure_ascii=False)}]
-                out.append(self._parse_array(self._chat(m2, "glm-4-flash", timeout), 1)[0])
-            return out
+                arr = self._parse_array(self._chat(m2, "glm-4-flash", timeout), 1)
+                if (target not in ("zh", "ja", "ko") and self._has_cjk(arr[0])) \
+                        or self._lang_suspect(arr, target):
+                    arr = self._parse_array(self._chat(m2, "glm-4-flash", timeout), 1)
+                out.append(arr[0])
+            return self._hygiene(out, target)
         except Exception as e:
             self.log(f"[翻译] GLM 逐条翻译失败：{e}")
             return None
@@ -301,6 +353,9 @@ class TranslateEngine:
                 dst = self._translate_batch([t for _, t in rest], target)
                 for (i, _), d in zip(rest, dst):
                     results[i] = d
+        if self._zhipu is not None:
+            results = self._zhipu._hygiene([_post_fix(r, target) for r in results], target)
+            return results
         return [_post_fix(r, target) for r in results]
 
     def translate(self, texts, target, batch_size=20):
