@@ -36,6 +36,16 @@ GLOSSARY = {
     "大容量杯": {
         "ru": "Большая ёмкость", "es": "Gran capacidad",
         "pt": "Grande capacidade", "en": "Large capacity"},
+    # 斜杠联项分类标签（葡语易被模型译串，固定精译）
+    "睡衣/长裙": {
+        "ru": "Пижама/длинные платья", "es": "Pijamas/vestidos largos",
+        "pt": "Pijamas/vestidos longos", "en": "Pajamas/dresses"},
+    "内衣/裤子": {
+        "ru": "Бельё/брюки", "es": "Ropa interior/pantalones",
+        "pt": "Roupa íntima/calças", "en": "Underwear/pants"},
+    "鞋子/杂物": {
+        "ru": "Обувь/мелочи", "es": "Zapatos/varios",
+        "pt": "Sapatos/diversos", "en": "Shoes/misc"},
     "饮品的最佳温度": {
         "ru": "Идеальная температура напитка", "es": "La temperatura ideal de la bebida",
         "pt": "A temperatura ideal da bebida", "en": "The perfect drink temperature"},
