@@ -222,6 +222,18 @@ def _estimate_colors(img_bgr, rect):
     if len(fg_px) == 0:
         return tuple(int(c) for c in bg), tuple(int(c) for c in bg)
     fg = np.median(fg_px, axis=0)
+    # 防混色：p75 估计落在中间灰，或亮度接近/高于背景（亮底上不可能有"白字"）时，
+    # 多半是深色笔画+浅色描边/图标混在一起；改看差异最大的前 5% 像素簇，取真正的文字本色
+    _lum = _luminance(fg)
+    _blum = _luminance(bg)
+    if 90 < _lum < 250 and _blum > _lum - 10:
+        th2 = np.percentile(dist, 95)
+        fg_px2 = pixels[dist >= th2]
+        if len(fg_px2) >= 10:
+            fg2 = np.median(fg_px2, axis=0)
+            _lum2 = _luminance(fg2)
+            if _lum2 < 70 or _lum2 > 225 or (_blum > 200 and _lum2 < _lum - 40):
+                fg = fg2
     return tuple(int(c) for c in fg), tuple(int(c) for c in bg)  # BGR
 
 
@@ -415,20 +427,28 @@ def _detect_border(img_bgr, rect):
     return (x1 + bx1, y1 + by1, x1 + bx2, y1 + by2)
 
 
-def _stroke_mask(img_bgr, rect, region_mask, k=7):
+def _stroke_mask(img_bgr, rect, region_mask, k=7, fg=None):
     """在框内按文字颜色提取笔画级 mask：只抹文字笔画，保住装饰边框/底色。
-    提取失败（如白字彩底标签）时回退整框 mask。"""
+    提取失败（如白字彩底标签）时回退整框 mask。
+    fg 可传入按未膨胀框估计的文字色（膨胀区含图标/邻行时重估极易混色误判极性）。"""
     x1, y1, x2, y2 = rect
     sub = img_bgr[y1:y2, x1:x2]
     if sub.size == 0:
         return region_mask
-    fg, _ = _estimate_colors(img_bgr, rect)
+    if fg is None:
+        fg, _ = _estimate_colors(img_bgr, rect)
     fl = _luminance(fg)
     gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
-    if fl < 128:
-        binary = (gray <= min(255, int(fl) + 70)).astype(np.uint8) * 255
-    else:
-        binary = (gray >= max(0, int(fl) - 70)).astype(np.uint8) * 255
+    # 主用 Otsu 自适应阈值（按文字明暗选极性），能完整覆盖渐变/半透明笔画；
+    # 退化（占比过小/过大）时回退固定边距阈值
+    _flag = cv2.THRESH_BINARY_INV if fl < 128 else cv2.THRESH_BINARY
+    _, binary = cv2.threshold(gray, 0, 255, _flag + cv2.THRESH_OTSU)
+    _ratio = float((binary > 0).mean())
+    if _ratio < 0.01 or _ratio > 0.6:
+        if fl < 128:
+            binary = (gray <= min(255, int(fl) + 95)).astype(np.uint8) * 255
+        else:
+            binary = (gray >= max(0, int(fl) - 95)).astype(np.uint8) * 255
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     rh, rw = sub.shape[:2]
     keep = np.zeros_like(binary)
@@ -442,7 +462,7 @@ def _stroke_mask(img_bgr, rect, region_mask, k=7):
         if area > rw * rh * 0.6:
             continue  # 超大块 = 底色区域，保留
         keep[labels == i] = 255
-    if int(keep.sum()) < 300:
+    if int((keep > 0).sum()) < 2:
         return region_mask  # 提取不到笔画，回退整框
     keep = cv2.dilate(keep, np.ones((k, k), np.uint8))
     out = np.zeros_like(region_mask)
@@ -492,11 +512,12 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
             if stroke_k is not None:
                 box_mask = np.zeros_like(mask)
                 box_mask[y1:y2, x1:x2] = 255
-                mask |= _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k)
+                mask |= _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k, fg=_fg_e)
             else:
                 mask[y1:y2, x1:x2] = 255
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         out = cv2.cvtColor(np.array(lama(Image.fromarray(rgb), Image.fromarray(mask))), cv2.COLOR_RGB2BGR)
+        out = out[:h, :w]  # SimpleLama 内部会把尺寸对齐到 8 的倍数，裁剪回原尺寸
         # 二次抹除：照片/渐变背景上 LaMa 可能留下淡淡的笔画回声，
         # 在修复结果上重新检测一遍残余笔画，有则再抹一次
         try:
@@ -515,13 +536,34 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 _fl2, _bl2 = _luminance(_fg2), _luminance(_bg2)
                 if not ((_fl2 < 110 and _bl2 > 140) or _fl2 > 170):
                     continue
+                # 残影检测：直接与背景色比亮度（深字找比背景暗的，白字找比背景亮的），
+                # 比在修复结果上重做 Otsu 笔画提取稳定得多（近均匀浅底上 Otsu 阈值漂移大）
                 _reg2 = np.zeros_like(mask)
-                _reg2[y1:y2, x1:x2] = 255
-                _k2 = 13 if _fl2 < 110 else 15
-                mask2 |= _stroke_mask(out, (x1, y1, x2, y2), _reg2, k=_k2)
+                _gray2 = cv2.cvtColor(out[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY).astype(np.int16)
+                if _fl2 < 110:
+                    _echo = (_gray2 < int(_bl2) - 25).astype(np.uint8) * 255
+                    _k2 = 13
+                else:
+                    _echo = (_gray2 > int(_bl2) + 25).astype(np.uint8) * 255
+                    _k2 = 15
+                # 滤掉触及区域外缘的连通块（图标/邻行文字等不属于本框残影的内容）
+                _n2, _lab2, _st2, _ = cv2.connectedComponentsWithStats(_echo, 8)
+                _eh, _ew = _echo.shape[:2]
+                _keep2 = np.zeros_like(_echo)
+                for _i in range(1, _n2):
+                    _cx, _cy, _cw, _ch, _ca = _st2[_i]
+                    if _ca < 6:
+                        continue
+                    if _cx <= 1 or _cy <= 1 or _cx + _cw >= _ew - 1 or _cy + _ch >= _eh - 1:
+                        continue  # 贴边 = 框外内容侵入，保留不抹
+                    _keep2[_lab2 == _i] = 255
+                _echo = cv2.dilate(_keep2, np.ones((_k2, _k2), np.uint8))
+                _reg2[y1:y2, x1:x2] = _echo
+                mask2 |= _reg2
             if int((mask2 > 0).sum()) > 300:
                 rgb2 = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
                 out = cv2.cvtColor(np.array(lama(Image.fromarray(rgb2), Image.fromarray(mask2))), cv2.COLOR_RGB2BGR)
+                out = out[:h, :w]
                 mask = cv2.bitwise_or(mask, mask2)
                 log("[图片] 检测到笔画残影，已二次抹除")
         except Exception:

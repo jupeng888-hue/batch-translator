@@ -1,0 +1,24 @@
+批量翻译工具 v1.5 - 使用说明
+================================
+
+【新功能】
+- 翻译可选智谱AI（GLM-4V 看图翻译，质量显著更好）：
+  到 bigmodel.cn 免费注册 -> 控制台 -> API Keys -> 新建，
+  把 Key 粘到软件"智谱AI Key"框里即可；不填自动用免费机翻。
+- 语种扩到 14 种主流语言：英/俄/西/葡/法/德/日/韩/阿/泰/越/印尼/意/土
+- 图片抹字升级 LaMa AI 无痕修复（首次运行下载约 200MB 模型，仅一次）
+
+【第一步：安装 Python】(已装过可跳过)
+1. https://www.python.org/downloads/release/python-3119/
+2. 下载 "Windows installer (64-bit)"，安装时勾选 "Add python.exe to PATH"
+
+【第二步：一键打包】
+双击 build.bat，等待 10-30 分钟，成品在 dist\BatchTranslator.exe
+
+【第三步：使用】
+双击 dist\BatchTranslator.exe，选文件夹、勾语言、点开始。
+媒体文件不上传，只联网传文字；填了智谱Key则文字发给智谱翻译。
+
+【常见问题】
+- 双击 build.bat 闪退：在文件夹地址栏输入 cmd 回车，输入 build.bat 回车，截图反馈。
+- 阿语/泰语等排版由系统字体渲染，Windows 自带字体即可正常显示。
