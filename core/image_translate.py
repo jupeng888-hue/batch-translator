@@ -192,7 +192,9 @@ def merge_line_boxes(items):
             max_h = max(last["h"], e["h"])
             v_close = abs(e["cy"] - (lr[1] + lr[3]) / 2) < min_h * 0.6
             gap = e["rect"][0] - lr[2]
-            h_close = gap < min_h * 0.6
+            # 只允许向右顺序拼接（同一行内、间距小）；
+            # 按 cy 排序时同行靠左的框会产生负间距，绝不合并（多栏清单会跨栏串行）
+            h_close = -2 <= gap < min_h * 0.6
             similar_h = max_h <= min_h * 1.4
             if v_close and h_close and similar_h:
                 x1 = min(lr[0], e["rect"][0]); y1 = min(lr[1], e["rect"][1])
@@ -222,6 +224,13 @@ def _estimate_colors(img_bgr, rect):
     if len(fg_px) == 0:
         return tuple(int(c) for c in bg), tuple(int(c) for c in bg)
     fg = np.median(fg_px, axis=0)
+    # 文字覆盖率不足 25% 时（宽扁框/多栏合并框），p75 取到的全是背景，
+    # 估计出的"文字色"≈背景色 → 改看差异最大的前 5% 像素簇
+    if int(max(fg) - min(fg)) <= 30 and np.abs(fg - bg).max() <= 30:
+        th0 = np.percentile(dist, 95)
+        fg_px0 = pixels[dist >= th0]
+        if len(fg_px0) >= 10:
+            fg = np.median(fg_px0, axis=0)
     # 防混色：p75 估计落在中间灰，或亮度接近/高于背景（亮底上不可能有"白字"）时，
     # 多半是深色笔画+浅色描边/图标混在一起；改看差异最大的前 5% 像素簇，取真正的文字本色
     _lum = _luminance(fg)
@@ -354,8 +363,9 @@ def _detect_label(img_bgr, rect):
     return (x1 + cx, y1 + cy, x1 + cx + cw, y1 + cy + ch), col
 
 
-def _label_stroke_mask(img_bgr, rect, label_col, region_mask):
-    """彩色标签内只抹文字笔画：取与标签色差异大的像素。"""
+def _label_stroke_mask(img_bgr, rect, label_col, region_mask, inner=None):
+    """彩色标签内只抹文字笔画：取与标签色差异大的像素。
+    inner 为未膨胀文字框：质心落在框外的连通块（如标签上部的数字/小数点）保留不抹。"""
     x1, y1, x2, y2 = rect
     sub = img_bgr[y1:y2, x1:x2]
     if sub.size == 0:
@@ -371,10 +381,21 @@ def _label_stroke_mask(img_bgr, rect, label_col, region_mask):
             continue
         if area > rw * rh * 0.5:
             continue
+        if inner is not None:
+            _gy = y1 + cy + ch / 2
+            if _gy < inner[1]:
+                continue  # 文字行上方的内容（如标签上部的数字）保留不抹
+        # 圆点状小组件（小数点/句点）保留：笔画组件不会是这么饱满的近似正方形
+        if area <= 150 and 0.5 <= cw / max(1, ch) <= 2.0 and area >= 0.5 * cw * ch:
+            continue
         keep[lab == i] = 255
     if int(keep.sum()) < 200:
         return region_mask
-    keep = cv2.dilate(keep, np.ones((11, 11), np.uint8))
+    keep = cv2.dilate(keep, np.ones((7, 7), np.uint8))
+    if inner is not None:
+        # 裁剪到文字行上缘以下：膨胀晕不许侵入文字行上方（数字/小数点区域）
+        _cut = max(0, inner[1] + 15 - y1)
+        keep[:_cut, :] = 0
     out = np.zeros_like(region_mask)
     out[y1:y2, x1:x2] = keep
     return out
@@ -485,6 +506,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
         h, w = img_bgr.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
         _unis = []
+        _flat_fills = []
         for box in boxes:
             pts = np.asarray(box, dtype=np.float64).reshape(-1, 2)
             x1 = max(0, int(pts[:, 0].min()) - dilate)
@@ -506,7 +528,8 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 (lx1, ly1, lx2, ly2), lcol = label
                 box_mask = np.zeros_like(mask)
                 box_mask[ly1:ly2, lx1:lx2] = 255
-                mask |= _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask)
+                mask |= _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask,
+                                           inner=(ux1, uy1, ux2, uy2))
                 continue
             if uni >= 0.5:
                 if fl < 110 and bl > 140:
@@ -520,8 +543,12 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 _unis.append(uni)
                 box_mask = np.zeros_like(mask)
                 box_mask[y1:y2, x1:x2] = 255
-                mask |= _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k, fg=_fg_e,
-                                     inner=(ux1, uy1, ux2, uy2))
+                _sm = _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k, fg=_fg_e,
+                                   inner=(ux1, uy1, ux2, uy2))
+                mask |= _sm
+                # 高均匀浅底：LaMa 容易留雾状残影，记下mask稍后按背景色平涂
+                if uni >= 0.65 and _luminance(_bg_e) > 200:
+                    _flat_fills.append((_sm, _bg_e))
             else:
                 _unis.append(uni)
                 mask[y1:y2, x1:x2] = 255
@@ -550,11 +577,13 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 # 比在修复结果上重做 Otsu 笔画提取稳定得多（近均匀浅底上 Otsu 阈值漂移大）
                 _reg2 = np.zeros_like(mask)
                 _gray2 = cv2.cvtColor(out[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY).astype(np.int16)
+                # 浅底（>240）残影与底色仅差十几级，阈值收紧到 12 才能抓到
+                _m2 = 12 if _bl2 > 240 else 25
                 if _fl2 < 110:
-                    _echo = (_gray2 < int(_bl2) - 25).astype(np.uint8) * 255
+                    _echo = (_gray2 < int(_bl2) - _m2).astype(np.uint8) * 255
                     _k2 = 13
                 else:
-                    _echo = (_gray2 > int(_bl2) + 25).astype(np.uint8) * 255
+                    _echo = (_gray2 > int(_bl2) + _m2).astype(np.uint8) * 255
                     _k2 = 15
                 # 滤掉触及区域外缘的连通块（图标/邻行文字等不属于本框残影的内容）
                 _n2, _lab2, _st2, _ = cv2.connectedComponentsWithStats(_echo, 8)
@@ -578,6 +607,9 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 log("[图片] 检测到笔画残影，已二次抹除")
         except Exception:
             pass
+        # 高均匀浅底平涂：LaMa 在这类背景上的填充色总会差几级，直接涂背景色无痕
+        for _fm, _fb in _flat_fills:
+            out[_fm > 0] = _fb
         # 边缘羽化融合：修复区与原图平滑过渡，消除矩形色块接缝
         m = mask.astype(np.float32) / 255.0
         m = cv2.dilate(m, np.ones((13, 13), np.uint8))  # 保证文字区完全不透原图
@@ -589,7 +621,13 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
         else:
             out_soft = out
         res = out_soft.astype(np.float32) * m[..., None] + img_bgr.astype(np.float32) * (1.0 - m[..., None])
-        return res.astype(np.uint8)
+        res = res.astype(np.uint8)
+        # 高均匀浅底二次定色：羽化环会把原图文字边缘按比例混回形成雾状残影，
+        # 均匀底色上直接把笔画区（含外晕）整体定成背景色，彻底杜绝残影
+        for _fm, _fb in _flat_fills:
+            _core = cv2.dilate((_fm > 0).astype(np.uint8), np.ones((25, 25), np.uint8))
+            res[_core > 0] = _fb
+        return res
     except Exception as e:
         log(f"[图片] LaMa 修复失败，回退传统算法：{e}")
         return None
