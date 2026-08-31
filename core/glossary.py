@@ -46,6 +46,28 @@ GLOSSARY = {
     "鞋子/杂物": {
         "ru": "Обувь/мелочи", "es": "Zapatos/varios",
         "pt": "Sapatos/diversos", "en": "Shoes/misc"},
+    # 收纳袋类目小标签（框小，固定短译避免断词/超框）
+    "束口袋": {
+        "ru": "Мешок на шнурке", "es": "Bolsa con cordón",
+        "pt": "Bolsa de amarrar", "en": "Drawstring bag"},
+    "内衣包": {
+        "ru": "Сумка для белья", "es": "Bolsa ropa interior",
+        "pt": "Bolsa roupa íntima", "en": "Lingerie bag"},
+    "衣服包中号": {
+        "ru": "Сумка для одежды M", "es": "Bolsa ropa mediana",
+        "pt": "Bolsa roupa média", "en": "Medium clothes bag"},
+    "衣服包大号": {
+        "ru": "Сумка для одежды L", "es": "Bolsa ropa grande",
+        "pt": "Bolsa roupa grande", "en": "Large clothes bag"},
+    "杂物袋": {
+        "ru": "Сумка для мелочей", "es": "Bolsa multiusos",
+        "pt": "Bolsa multiuso", "en": "Utility bag"},
+    "鞋袋": {
+        "ru": "Сумка для обуви", "es": "Bolsa para zapatos",
+        "pt": "Bolsa para sapatos", "en": "Shoe bag"},
+    "平口袋": {
+        "ru": "Плоская сумка", "es": "Bolsa plana",
+        "pt": "Bolsa plana", "en": "Flat pouch"},
     "饮品的最佳温度": {
         "ru": "Идеальная температура напитка", "es": "La temperatura ideal de la bebida",
         "pt": "A temperatura ideal da bebida", "en": "The perfect drink temperature"},

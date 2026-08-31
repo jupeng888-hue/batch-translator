@@ -765,7 +765,7 @@ def _luminance(bgr):
 def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                     left_limit=None, right_limit=None, tight=False, orig_bgr=None,
                     top_limit=None, bottom_limit=None, allow_widen=True,
-                    label_mode=False):
+                    label_mode=False, force_size=None, probe=False):
     """在矩形区域内回填译文：允许水平适度扩展，优先单行、贴近原字号。
     自动加描边（浅色文字配深描边、深色文字配浅描边），提升复杂背景可读性。"""
     x1, y1, x2, y2 = rect
@@ -795,6 +795,9 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
     single = None  # 单行候选：(font, lines, line_h, total_h, size)
     start = max(8, int(box_h * 0.95))
     floor = max(10, int(box_h * 0.30))
+    if force_size is not None:
+        # 同一水平带的文字统一字号（由调用方探测本组最小可行字号后强制指定）
+        start = floor = max(8, int(force_size))
     n_words0 = len(text.split())
     cand = []  # 可行候选（字号从大到小）
     for size in range(start, floor - 1, -1):
@@ -803,6 +806,11 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
         line_h = int((ascent + descent) * 1.12)
         if single is None and draw.textlength(text, font=font) <= box_w:
             single = (font, [text], line_h, line_h, size)
+        # 断词保护：最长单词都放不下的字号直接跳过，宁可更小也不把单词截断
+        if max((draw.textlength(_wd, font=font) for _wd in text.split()), default=0) > box_w:
+            if best is None:
+                best = (font, _wrap_balanced(draw, text, font, box_w), line_h, line_h * 9)
+            continue
         lines = _wrap_balanced(draw, text, font, box_w)
         total_h = line_h * len(lines)
         max_line_w = max((draw.textlength(l, font=font) for l in lines), default=0)
@@ -834,6 +842,17 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                         break
         best = chosen
     font, lines, line_h, total_h = best
+    # 断词兜底：选定字号下最长单词仍超宽时，逐级缩到单词完整放下为止
+    if max((draw.textlength(_wd, font=font) for _wd in text.split()), default=0) > box_w:
+        for _s in range(font.size - 1, 7, -1):
+            _f = _load_font(_s, bold=bold)
+            if max((draw.textlength(_wd, font=_f) for _wd in text.split()), default=0) <= box_w:
+                font = _f
+                lines = _wrap_balanced(draw, text, font, box_w)
+                _a2, _d2 = font.getmetrics()
+                line_h = int((_a2 + _d2) * 1.12)
+                total_h = line_h * len(lines)
+                break
     n_words = len(text.split())
 
     def _orphan_count(ls):
@@ -900,6 +919,8 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                     line_h = int((a3 + d3) * 1.12)
                     font, total_h = f3, line_h
                     break
+    if probe:
+        return font.size  # 仅探测字号，不落笔
     # 描边颜色：优先继承原图描边色，否则用与文字亮度反差的中性色
     fg_lum = _luminance(fg_bgr)
     stroke_rgb = (30, 30, 30) if fg_lum > 128 else (240, 240, 240)
@@ -981,6 +1002,9 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
     # 回填
     orig_bgr = img_bgr
     rects = [_box_to_rect(b) for b, _ in keep]
+    # 第一遍：确定每框的落字参数并探测各自可行字号；
+    # 同一水平带（图标行/顶栏等）统一用组内最小字号，避免同排文字大小不一
+    _jobs = []
     for (box, src_text), dst_text, rect, smooth in zip(keep, translations, rects, smooth_flags):
         fg, _bg = _estimate_colors(orig_bgr, rect)
         # 计算左右扩展限制：同一水平带上最近的邻框边缘
@@ -1041,12 +1065,49 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
                 x1, y1, x2, y2 = rect
                 expand = 1.0
                 allow_widen = False
-        img_pil = draw_text_block(img_pil, rect, dst_text, fg, expand=expand,
-                                  left_limit=left_limit, right_limit=right_limit,
+        _size = draw_text_block(img_pil, rect, dst_text, fg, expand=expand,
+                                left_limit=left_limit, right_limit=right_limit,
+                                orig_bgr=orig_bgr, tight=True,
+                                top_limit=top_limit, bottom_limit=bottom_limit,
+                                allow_widen=allow_widen,
+                                label_mode=_label is not None, probe=True)
+        _jobs.append(dict(rect=rect, dst=dst_text, fg=fg, expand=expand,
+                          left_limit=left_limit, right_limit=right_limit,
+                          top_limit=top_limit, bottom_limit=bottom_limit,
+                          allow_widen=allow_widen, label_mode=_label is not None,
+                          size=_size if isinstance(_size, int) else None,
+                          cy=(rect[1] + rect[3]) / 2, bh=rect[3] - rect[1]))
+
+    # 同排统一字号：按纵向中心分组（带高相近），组内取最小可行字号
+    _forced = [None] * len(_jobs)
+    _used = [False] * len(_jobs)
+    for i, a in enumerate(_jobs):
+        if _used[i] or a["size"] is None:
+            continue
+        grp = [i]
+        _used[i] = True
+        for j in range(i + 1, len(_jobs)):
+            b = _jobs[j]
+            if _used[j] or b["size"] is None:
+                continue
+            if abs(b["cy"] - a["cy"]) <= max(a["bh"], b["bh"]) * 0.6 \
+                    and min(a["bh"], b["bh"]) >= max(a["bh"], b["bh"]) * 0.65:
+                grp.append(j)
+                _used[j] = True
+        if len(grp) > 1:
+            _smin = min(_jobs[g]["size"] for g in grp)
+            for g in grp:
+                _forced[g] = _smin
+
+    for j, jb in enumerate(_jobs):
+        img_pil = draw_text_block(img_pil, jb["rect"], jb["dst"], jb["fg"],
+                                  expand=jb["expand"],
+                                  left_limit=jb["left_limit"], right_limit=jb["right_limit"],
                                   orig_bgr=orig_bgr, tight=True,
-                                  top_limit=top_limit, bottom_limit=bottom_limit,
-                                  allow_widen=allow_widen,
-                                  label_mode=_label is not None)
+                                  top_limit=jb["top_limit"], bottom_limit=jb["bottom_limit"],
+                                  allow_widen=jb["allow_widen"],
+                                  label_mode=jb["label_mode"],
+                                  force_size=_forced[j])
 
     out_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
