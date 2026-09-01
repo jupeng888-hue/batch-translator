@@ -803,7 +803,7 @@ def _luminance(bgr):
 def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                     left_limit=None, right_limit=None, tight=False, orig_bgr=None,
                     top_limit=None, bottom_limit=None, allow_widen=True,
-                    label_mode=False, force_size=None, probe=False):
+                    label_mode=False, force_size=None, probe=False, force_bold=None):
     """在矩形区域内回填译文：允许水平适度扩展，优先单行、贴近原字号。
     自动加描边（浅色文字配深描边、深色文字配浅描边），提升复杂背景可读性。"""
     x1, y1, x2, y2 = rect
@@ -826,7 +826,8 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
     h_slack = 1.06 if label_mode else 1.3
     draw = ImageDraw.Draw(img_pil)
     fg_rgb = (fg_bgr[2], fg_bgr[1], fg_bgr[0])
-    bold = _estimate_bold(orig_bgr, rect, fg_bgr) if orig_bgr is not None else False
+    bold = force_bold if force_bold is not None \
+        else (_estimate_bold(orig_bgr, rect, fg_bgr) if orig_bgr is not None else False)
 
     # 以原始框高为基准搜索合适字号与断行；字号设下限，避免译文缩得过小
     best = None
@@ -1114,10 +1115,12 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
                           top_limit=top_limit, bottom_limit=bottom_limit,
                           allow_widen=allow_widen, label_mode=_label is not None,
                           size=_size if isinstance(_size, int) else None,
+                          bold=_estimate_bold(orig_bgr, rect, fg) if orig_bgr is not None else False,
                           cy=(rect[1] + rect[3]) / 2, bh=rect[3] - rect[1]))
 
     # 同排统一字号：按纵向中心分组（带高相近），组内取最小可行字号
     _forced = [None] * len(_jobs)
+    _fbold = [None] * len(_jobs)
     _used = [False] * len(_jobs)
     for i, a in enumerate(_jobs):
         if _used[i] or a["size"] is None:
@@ -1137,6 +1140,86 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
             for g in grp:
                 _forced[g] = _smin
 
+    # 网格行带二次合并：框高相近、列区间重叠、行距近的相邻行带 → 视为同一表格，统一字号
+    _bands = []
+    _seen = set()
+    for i in range(len(_jobs)):
+        if _forced[i] is None or i in _seen:
+            continue
+        _mem = {g for g in range(len(_jobs))
+                if _jobs[g]["size"] is not None
+                and abs(_jobs[g]["cy"] - _jobs[i]["cy"]) <= max(_jobs[i]["bh"], _jobs[g]["bh"]) * 0.6
+                and min(_jobs[i]["bh"], _jobs[g]["bh"]) >= max(_jobs[i]["bh"], _jobs[g]["bh"]) * 0.45}
+        _seen |= _mem
+        _bands.append({"members": _mem,
+                       "cy": sum(_jobs[g]["cy"] for g in _mem) / len(_mem),
+                       "bh": max(_jobs[g]["bh"] for g in _mem),
+                       "x1": min(_jobs[g]["rect"][0] for g in _mem),
+                       "x2": max(_jobs[g]["rect"][2] for g in _mem)})
+    _merged = True
+    while _merged:
+        _merged = False
+        for _bi in range(len(_bands)):
+            for _bj in range(_bi + 1, len(_bands)):
+                A, B = _bands[_bi], _bands[_bj]
+                if not A["members"] or not B["members"]:
+                    continue
+                _ovl = min(A["x2"], B["x2"]) - max(A["x1"], B["x1"])
+                _nw = min(A["x2"] - A["x1"], B["x2"] - B["x1"])
+                if min(A["bh"], B["bh"]) >= max(A["bh"], B["bh"]) * 0.65 \
+                        and _ovl >= _nw * 0.5 \
+                        and abs(A["cy"] - B["cy"]) <= max(A["bh"], B["bh"]) * 4.0:
+                    A["members"] |= B["members"]
+                    A["cy"] = (A["cy"] + B["cy"]) / 2
+                    A["bh"] = max(A["bh"], B["bh"])
+                    A["x1"] = min(A["x1"], B["x1"]); A["x2"] = max(A["x2"], B["x2"])
+                    B["members"] = set()
+                    _merged = True
+    # 限高框拖低整组字号：对拉低组内最小字号的成员，按行带最大框高重新探测（允许多行），抬高统一字号
+    for _bd in _bands:
+        if len(_bd["members"]) <= 2:
+            continue
+        for _ in range(2):
+            _smin = min(_jobs[g]["size"] for g in _bd["members"])
+            _grown = False
+            for g in _bd["members"]:
+                jb = _jobs[g]
+                if jb["size"] != _smin:
+                    continue
+                x1, y1, x2, y2 = jb["rect"]
+                if y2 - y1 >= _bd["bh"]:
+                    continue
+                _cy2 = (y1 + y2) / 2
+                _hh = _bd["bh"] / 2
+                _ny1 = int(_cy2 - _hh)
+                _ny2 = int(_cy2 + _hh)
+                if jb["top_limit"] is not None:
+                    _ny1 = max(_ny1, jb["top_limit"])
+                if jb["bottom_limit"] is not None:
+                    _ny2 = min(_ny2, jb["bottom_limit"])
+                if _ny2 - _ny1 <= y2 - y1:
+                    continue
+                _ns = draw_text_block(img_pil, (x1, _ny1, x2, _ny2), jb["dst"], jb["fg"],
+                                      expand=jb["expand"],
+                                      left_limit=jb["left_limit"], right_limit=jb["right_limit"],
+                                      orig_bgr=orig_bgr, tight=True,
+                                      top_limit=jb["top_limit"], bottom_limit=jb["bottom_limit"],
+                                      allow_widen=jb["allow_widen"],
+                                      label_mode=jb["label_mode"], probe=True)
+                if isinstance(_ns, int) and _ns > jb["size"]:
+                    jb["size"] = _ns
+                    jb["rect"] = (x1, _ny1, x2, _ny2)
+                    jb["cy"] = _cy2
+                    jb["bh"] = _ny2 - _ny1
+                    _grown = True
+            if not _grown:
+                break
+        _smin = min(_jobs[g]["size"] for g in _bd["members"])
+        _bb = sum(1 for g in _bd["members"] if _jobs[g]["bold"]) * 2 > len(_bd["members"])
+        for g in _bd["members"]:
+            _forced[g] = _smin
+            _fbold[g] = _bb
+
     for j, jb in enumerate(_jobs):
         img_pil = draw_text_block(img_pil, jb["rect"], jb["dst"], jb["fg"],
                                   expand=jb["expand"],
@@ -1145,7 +1228,7 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
                                   top_limit=jb["top_limit"], bottom_limit=jb["bottom_limit"],
                                   allow_widen=jb["allow_widen"],
                                   label_mode=jb["label_mode"],
-                                  force_size=_forced[j])
+                                  force_size=_forced[j], force_bold=_fbold[j])
 
     out_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
