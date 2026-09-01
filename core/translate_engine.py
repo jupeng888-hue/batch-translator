@@ -198,25 +198,52 @@ class _Zhipu:
     }
 
     def _lang_suspect(self, arr, target):
-        """目标语种有独立文字体系时，整批译文一个该文字体系的字符都没有 = 模型答错语种。"""
+        """目标语种有独立文字体系时判错语种：整批一个该体系字符都没有，或任何一条
+        含拉丁字母却一个目标文字体系字符都没有（如俄语译文写成英语）= 模型答错语种。"""
         rng = self._SCRIPT_RANGES.get(target)
         if not rng:
             return False
         joined = "".join(arr)
-        return not any(rng[0] <= c <= rng[1] for c in joined)
+        if not any(rng[0] <= c <= rng[1] for c in joined):
+            return True
+        for t in arr:
+            has_target = any(rng[0] <= c <= rng[1] for c in t)
+            has_latin = any('a' <= c.lower() <= 'z' for c in t)
+            if has_latin and not has_target:
+                return True  # 该条是纯拉丁文（英语等），目标语种应有独立文字
+        return False
 
     def _hygiene(self, out, target):
-        """非中日韩目标语种的译文不允许残留中文字符；残留则尝试剔除。"""
+        """非中日韩目标语种的译文不允许残留中文字符。残留时先单条重译（直接剔除
+        会把"С前面 есть…"剔成病句），重译仍残留才剔除。"""
         if target in ("zh", "ja", "ko"):
             return out
+        import json as _json
         fixed = []
         for t in out:
-            if self._has_cjk(t):
-                t2 = self._strip_cjk(t)
-                self.log(f"[翻译] 译文含中文残留，已剔除: {t!r} -> {t2!r}")
-                fixed.append(t2 if t2 else t)
-            else:
+            if not self._has_cjk(t):
                 fixed.append(t)
+                continue
+            t2 = None
+            for _ in range(3):
+                try:
+                    lang = LANG_EN_NAME[target]
+                    m2 = [{"role": "system", "content":
+                           f"你是电商文案翻译引擎。把给定的中文电商文案翻译成地道、简洁的 {lang}，"
+                           "像是母语运营写的。只输出译文文本，不要任何其他文字。"},
+                          {"role": "user", "content": t}]
+                    r = self._chat(m2, "glm-4-flash", 30).strip().strip('"').strip("'")
+                    if r and not self._has_cjk(r) and not self._lang_suspect([r], target):
+                        t2 = r
+                        break
+                except Exception:
+                    pass
+            if t2 is None:
+                t2 = self._strip_cjk(t) or t
+                self.log(f"[翻译] 译文含中文残留，重译失败已剔除: {t!r} -> {t2!r}")
+            else:
+                self.log(f"[翻译] 译文含中文残留，已单条重译: {t!r} -> {t2!r}")
+            fixed.append(t2)
         return fixed
 
     def translate(self, texts, target, image_path=None, timeout=90):
@@ -227,7 +254,8 @@ class _Zhipu:
             f"你是电商文案翻译引擎。把给定的中文电商文案翻译成地道、简洁的 {lang}，"
             "像是母语运营写的，不要直译腔。规则："
             "1) 保留数字、型号、单位（如 304、12小时、30 oz 按目标语言习惯书写）；"
-            "2) 逐条对应，不多不少；3) 只输出 JSON 字符串数组（每个元素是纯译文文本，不要输出对象），不要任何其他文字；4) 输入文字来自 OCR 识别，可能有错别字，请按合理含义翻译。")
+            "2) 逐条对应，不多不少；3) 只输出 JSON 字符串数组（每个元素是纯译文文本，不要输出对象），不要任何其他文字；4) 输入文字来自 OCR 识别，可能有错别字，请按合理含义翻译；"
+            f"5) 每一条都必须全部使用{lang}，严禁把任何一条译成英语或其他语言（原文本身的品牌英文名除外）。")
         user_text = "待翻译中文列表：\n" + _json.dumps(texts, ensure_ascii=False)
         img_ext = None
         if image_path:

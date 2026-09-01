@@ -520,6 +520,12 @@ def _stroke_mask(img_bgr, rect, region_mask, k=7, fg=None, inner=None):
             binary = (gray <= min(255, int(fl) + 95)).astype(np.uint8) * 255
         else:
             binary = (gray >= max(0, int(fl) - 95)).astype(np.uint8) * 255
+    # 彩色笔画补抓：Otsu 按文字主色亮度选极性，混色标题（如黑字+橙色字）中
+    # 与主色亮度反向的彩色笔画会整段漏抹；按饱和度补抓（灰/白/黑背景饱和度低，不受影响）
+    _hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    _colored = ((_hsv[..., 1] > 70) & (_hsv[..., 2] > 60)).astype(np.uint8) * 255
+    if 0 < int((_colored > 0).sum()) < sub.shape[0] * sub.shape[1] * 0.5:
+        binary = cv2.bitwise_or(binary, _colored)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     rh, rw = sub.shape[:2]
     keep = np.zeros_like(binary)
@@ -546,14 +552,48 @@ def _stroke_mask(img_bgr, rect, region_mask, k=7, fg=None, inner=None):
     return out
 
 
-def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
-    """LaMa AI 无痕抹字；失败返回 None 由调用方回退。"""
+def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
+    """LaMa AI 无痕抹字；失败返回 None 由调用方回退。
+    protect: 不抹除的框列表（如无中文的英文/装饰文字框）——中文框膨胀后与邻行
+    英文框重叠时，抹除/残影检测会误伤英文笔画，这里整区保护。"""
     lama = _get_lama(log)
     if lama is None:
         return None
     try:
         h, w = img_bgr.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
+        _prot_rects = []
+        for _pb in (protect or []):
+            _pp = np.asarray(_pb, dtype=np.float64).reshape(-1, 2)
+            _prot_rects.append((max(0, int(_pp[:, 0].min()) - 2), max(0, int(_pp[:, 1].min()) - 2),
+                                min(w, int(_pp[:, 0].max()) + 2), min(h, int(_pp[:, 1].max()) + 2)))
+
+        def _apply_protect(m):
+            # 只保护框内"自己的笔画"：整框清零会把斜排/叠排中文框伸进来的笔画底部
+            # 也留成残字。取框内与背景差异的连通块，贴边块（邻行中文笔画/背景纹理
+            # 侵入）不保护，内部块（英文/数字自身）膨胀后保护。
+            for _px1, _py1, _px2, _py2 in _prot_rects:
+                _psub = img_bgr[_py1:_py2, _px1:_px2]
+                if _psub.size == 0:
+                    continue
+                _pgray = cv2.cvtColor(_psub, cv2.COLOR_BGR2GRAY)
+                _phsv = cv2.cvtColor(_psub, cv2.COLOR_BGR2HSV)
+                _pmed = float(np.median(_pgray))
+                _pb = (((_pgray.astype(np.float32) < _pmed - 25) |
+                        ((_phsv[..., 1] > 60) & (_phsv[..., 2] > 60))).astype(np.uint8)) * 255
+                _pn, _plab, _pst, _ = cv2.connectedComponentsWithStats(_pb, 8)
+                _ph, _pw = _pb.shape[:2]
+                _pk = np.zeros_like(_pb)
+                for _pi in range(1, _pn):
+                    _cx, _cy, _cw, _ch, _ca = _pst[_pi]
+                    if _ca < 8:
+                        continue
+                    if _cx <= 1 or _cy <= 1 or _cx + _cw >= _pw - 1 or _cy + _ch >= _ph - 1:
+                        continue  # 贴边 = 框外内容（邻行中文笔画/纹理），不保护
+                    _pk[_plab == _pi] = 255
+                _pk = cv2.dilate(_pk, np.ones((7, 7), np.uint8))
+                m[_py1:_py2, _px1:_px2][_pk > 0] = 0
+            return m
         _stroke_union = np.zeros((h, w), dtype=np.uint8)
         _unis = []
         _flat_fills = []
@@ -603,15 +643,27 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                                    inner=(ux1, uy1, ux2, uy2))
                 mask |= _sm
                 _stroke_union |= _sm
-                # 高均匀浅底：LaMa 容易留雾状残影，记下mask稍后按背景色平涂
-                if uni >= 0.65 and _luminance(_bg_e) > 200:
-                    _flat_fills.append((_sm, _bg_e))
+                # 近白平整底：LaMa 填充色总比纯白差几级，留雾状残影，记下mask稍后按背景色平涂。
+                # 纹理守卫（Sobel 梯度）已能排除网格/织物，故不再要求框内均匀度——
+                # 粗体大标题文字占比高会把 uni 拉低，导致纯白底反而漏掉平涂留灰鬼影
+                if _luminance(_bg_e) > 235:
+                    _gsub = cv2.cvtColor(img_bgr[uy1:uy2, ux1:ux2], cv2.COLOR_BGR2GRAY)
+                    _gx64 = cv2.Sobel(_gsub, cv2.CV_64F, 1, 0, ksize=3)
+                    _gy64 = cv2.Sobel(_gsub, cv2.CV_64F, 0, 1, ksize=3)
+                    _mag = np.sqrt(_gx64 ** 2 + _gy64 ** 2)
+                    # 只在接近底色的像素上统计纹理——粗黑笔画自身的边缘梯度极高，
+                    # 全框统计会把纯白底误判成"纹理背景"而跳过平涂
+                    _bg_px = np.abs(_gsub.astype(np.float32) - _luminance(_bg_e)) < 12
+                    _tex = float(_mag[_bg_px].mean()) if _bg_px.any() else 0.0
+                    if _tex < 60:
+                        _flat_fills.append((_sm, _bg_e))
             else:
                 _unis.append(uni)
                 mask[y1:y2, x1:x2] = 255
         # 混合修复：笔画级 mask 用 Telea 沿边缘方向扩散填充（保住纹理/交界锐度；
         # LaMa 在这类结构背景上会把交界糊成雾斑）。整块 mask（照片背景大面积缺失）
         # 仍用 LaMa，避免 Telea 在大区域上留涂抹痕。
+        mask = _apply_protect(mask)
         out = cv2.inpaint(img_bgr, mask, 5, cv2.INPAINT_TELEA)
         _mask_lama = mask & ~cv2.dilate(_stroke_union, np.ones((9, 9), np.uint8))
         if int((_mask_lama > 0).sum()) > 0:
@@ -693,6 +745,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 _reg2[y1:y2, x1:x2] = _echo
                 mask2 |= _reg2
             if int((mask2 > 0).sum()) > 300:
+                mask2 = _apply_protect(mask2)
                 out = cv2.inpaint(out, mask2, 5, cv2.INPAINT_TELEA)  # 残影均为细笔画，Telea 即可
                 mask = cv2.bitwise_or(mask, mask2)
                 log("[图片] 检测到笔画残影，已二次抹除")
@@ -736,7 +789,9 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
         # 高均匀浅底二次定色：羽化环会把原图文字边缘按比例混回形成雾状残影，
         # 均匀底色上直接把笔画区（含外晕）整体定成背景色，彻底杜绝残影
         for _fm, _fb in _flat_fills:
-            _core = cv2.dilate((_fm > 0).astype(np.uint8), np.ones((25, 25), np.uint8))
+            # 核必须盖住羽化尾（mask 膨胀 13 + σ8 模糊尾约 29px），粗笔画抗锯齿边缘
+            # 在尾区以低透明度混回会形成 229 级灰鬼影，膨胀 45 才能整体吞掉
+            _core = cv2.dilate((_fm > 0).astype(np.uint8), np.ones((45, 45), np.uint8))
             res[_core > 0] = _fb
         return res
     except Exception as e:
@@ -950,7 +1005,10 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
         start = floor = max(8, int(force_size))
     n_words0 = len(text.split())
     cand = []  # 可行候选（字号从大到小）
-    for size in range(start, floor - 1, -1):
+    # 标签模式放宽字号下探范围：长译文（如俄语长单词）在常规下限时只能一词一行
+    # 并溢出标签，允许继续缩小换取"更少行数且完整落在标签内"
+    _loop_floor = 9 if label_mode else floor
+    for size in range(start, _loop_floor - 1, -1):
         font = _load_font(size, bold=bold)
         ascent, descent = font.getmetrics()
         line_h = int((ascent + descent) * 1.12)
@@ -979,7 +1037,11 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                 single = (f1, [text], lh1, lh1, size)
                 break
     if cand:
-        chosen = cand[0]
+        if label_mode:
+            # 标签内优先更少行数（同行数取最大字号）：避免一词一行的竖排式溢出
+            chosen = min(cand, key=lambda c: (len(c[1]), -c[0].size))
+        else:
+            chosen = cand[0]
         # 若最大字号方案存在孤词行，改用行数更少、无孤词且字号损失≤30% 的方案
         if n_words0 >= 3:
             def _orphans(c):
@@ -1124,7 +1186,8 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
         return {"path": output_path, "texts": 0}
 
     keep = [(item[0], item[1].strip()) for item in result if item[1].strip()]
-    # 只处理含中文的文字框；英文/数字/装饰字符原样保留
+    # 只处理含中文的文字框；英文/数字/装饰字符原样保留（且抹除时整区保护，防误伤）
+    _protect_boxes = [b for b, t in keep if not contains_cjk(t)]
     keep = [(b, t) for b, t in keep if contains_cjk(t)]
     if not keep:
         log(f"[图片] 未检测到中文文字，原样复制: {os.path.basename(image_path)}")
@@ -1142,7 +1205,8 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
         translations = engine.translate([t for _, t in keep], target)
 
     # 抹字：LaMa AI 无痕修复优先，失败回退传统算法（返回每框背景平滑标记）
-    _erased = erase_text_lama(img_bgr, [b for b, _ in keep], log=log)
+    _erased = erase_text_lama(img_bgr, [b for b, _ in keep], log=log,
+                              protect=_protect_boxes)
     if _erased is not None:
         erased, smooth_flags = _erased, [False] * len(keep)
     else:
