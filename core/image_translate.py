@@ -371,7 +371,8 @@ def _label_stroke_mask(img_bgr, rect, label_col, region_mask, inner=None):
     if sub.size == 0:
         return region_mask
     d = np.abs(sub.astype(np.float32) - np.array(label_col, dtype=np.float32)).max(axis=2)
-    binary = (d > 70).astype(np.uint8) * 255
+    # 阈值 45：白字半透明描边的 d 值集中在 45~70，70 会漏掉描边留下白色残印
+    binary = (d > 45).astype(np.uint8) * 255
     n, lab, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     rh, rw = sub.shape[:2]
     keep = np.zeros_like(binary)
@@ -392,6 +393,11 @@ def _label_stroke_mask(img_bgr, rect, label_col, region_mask, inner=None):
         if area < 6:
             continue
         if area > rw * rh * 0.5:
+            continue
+        # 触及标签外缘的组件是标签边缘阴影/描边（或贴边的数字），不是文字：
+        # 不抹，并记入 prot 防止其他笔画的膨胀晕伤到它们
+        if cx <= 1 or cy <= 1 or cx + cw >= rw - 1 or cy + ch >= rh - 1:
+            prot[lab == i] = 255
             continue
         if inner is not None:
             _gy = y1 + cy + ch / 2
@@ -439,7 +445,9 @@ def _label_stroke_mask(img_bgr, rect, label_col, region_mask, inner=None):
         keep[cv2.dilate(prot, np.ones((7, 7), np.uint8)) > 0] = 0
     out = np.zeros_like(region_mask)
     out[y1:y2, x1:x2] = keep
-    return out
+    _prot_full = np.zeros_like(region_mask)
+    _prot_full[y1:y2, x1:x2] = prot
+    return out, _prot_full
 
 
 def _bg_uniformity(img_bgr, rect, bg_bgr):
@@ -549,6 +557,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
         _stroke_union = np.zeros((h, w), dtype=np.uint8)
         _unis = []
         _flat_fills = []
+        _label_fills = []
         for box in boxes:
             pts = np.asarray(box, dtype=np.float64).reshape(-1, 2)
             x1 = max(0, int(pts[:, 0].min()) - dilate)
@@ -570,9 +579,11 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 (lx1, ly1, lx2, ly2), lcol = label
                 box_mask = np.zeros_like(mask)
                 box_mask[ly1:ly2, lx1:lx2] = 255
-                _lsm = _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask,
-                                          inner=(ux1, uy1, ux2, uy2))
+                _lsm, _lprot = _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask,
+                                                  inner=(ux1, uy1, ux2, uy2))
                 mask |= _lsm
+                _label_fills.append((cv2.dilate(_lsm, np.ones((15, 15), np.uint8)),
+                                     (lx1, ly1, lx2, ly2), lcol, _lprot))
                 # 标签笔画不走 Telea：白字边缘未盖全时 Telea 会把高光扩散成雾状残字，
                 # 标签底色单纯，交给 LaMa 语义填充更干净
                 continue
@@ -618,9 +629,38 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 y1 = max(0, int(pts[:, 1].min()) - dilate)
                 x2 = min(w, int(pts[:, 0].max()) + dilate)
                 y2 = min(h, int(pts[:, 1].max()) + dilate)
-                # 彩色标签/装饰边框区域跳过：二抹会误伤标签底色
-                if _detect_label(img_bgr, (max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min())),
-                                         min(w, int(pts[:, 0].max())), min(h, int(pts[:, 1].max())))) is not None:
+                # 彩色标签单独做残印清理：检测标签色外的亮残点（白字描边漏网），
+                # Telea 用周围标签色扩散填平（标签底色单纯，不会产生雾状扩散）
+                _lab2 = _detect_label(img_bgr, (max(0, int(pts[:, 0].min())), max(0, int(pts[:, 1].min())),
+                                                min(w, int(pts[:, 0].max())), min(h, int(pts[:, 1].max()))))
+                if _lab2 is not None:
+                    (_lx1, _ly1, _lx2, _ly2), _lcol2 = _lab2
+                    _lsub = out[_ly1:_ly2, _lx1:_lx2]
+                    _ld = np.abs(_lsub.astype(np.float32) - np.array(_lcol2, np.float32)).max(axis=2)
+                    _llum = float(_luminance(_lcol2))
+                    _lres = (((_ld > 25) | (cv2.cvtColor(_lsub, cv2.COLOR_BGR2GRAY).astype(np.float32) > _llum + 18)).astype(np.uint8)) * 255
+                    # 只取不触及标签边缘的内部连通块：渐变/阴影都贴在标签边缘，残字在内部
+                    _ln, _ll2, _lst, _ = cv2.connectedComponentsWithStats(_lres, 8)
+                    _lh2, _lw2 = _lres.shape[:2]
+                    _lk = np.zeros_like(_lres)
+                    for _i in range(1, _ln):
+                        _cx, _cy, _cw, _ch, _ca = _lst[_i]
+                        if _ca < 4:
+                            continue
+                        if _cx <= 1 or _cy <= 1 or _cx + _cw >= _lw2 - 1 or _cy + _ch >= _lh2 - 1:
+                            continue
+                        _lk[_ll2 == _i] = 255
+                    _lres = cv2.dilate(_lk, np.ones((9, 9), np.uint8))
+                    # 受保护组件（数字/小数点/贴边阴影）不清理
+                    for _lm3, (_px1, _py1, _px2, _py2), _, _lp3 in _label_fills:
+                        if _px1 < _lx2 and _px2 > _lx1 and _py1 < _ly2 and _py2 > _ly1:
+                            _lres[cv2.dilate(_lp3, np.ones((9, 9), np.uint8))[_ly1:_ly2, _lx1:_lx2] > 0] = 0
+                    if int((_lres > 0).sum()) > 30:
+                        _fm = np.zeros_like(mask)
+                        _fm[_ly1:_ly2, _lx1:_lx2] = _lres
+                        out = cv2.inpaint(out, _fm, 5, cv2.INPAINT_TELEA)
+                        mask = cv2.bitwise_or(mask, _fm)
+                        log("[图片] 检测到标签残印，已清理")
                     continue
                 _fg2, _bg2 = _estimate_colors(img_bgr, (x1, y1, x2, y2))
                 _fl2, _bl2 = _luminance(_fg2), _luminance(_bg2)
@@ -678,6 +718,21 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
             out_soft = out.astype(np.float32)
         res = out_soft * m[..., None] + img_bgr.astype(np.float32) * (1.0 - m[..., None])
         res = res.astype(np.uint8)
+        # 标签底色定色：LaMa/羽化在纯色标签上总会留 faint 字影，逐行取标签未抹像素的
+        # 中位色填回笔画区——标签是纯色/纵向渐变，逐行中位色即真实底色，残印归零
+        for _lm2, (_lx1, _ly1, _lx2, _ly2), _lc2, _ in _label_fills:
+            _sub0 = img_bgr[_ly1:_ly2, _lx1:_lx2].astype(np.float32)
+            _d0 = np.abs(_sub0 - np.array(_lc2, np.float32)).max(axis=2)
+            _pill = cv2.dilate((_d0 < 45).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+            _zone = (_lm2[_ly1:_ly2, _lx1:_lx2] > 0) & _pill  # 只填标签底内部，不出界
+            for _yi in range(_ly2 - _ly1):
+                _rm = _zone[_yi]
+                if not _rm.any():
+                    continue
+                _src = _sub0[_yi][(_d0[_yi] < 45) & ~_rm]
+                if len(_src) < 8:
+                    continue
+                res[_ly1 + _yi, _lx1:_lx2][_rm] = np.median(_src, axis=0)
         # 高均匀浅底二次定色：羽化环会把原图文字边缘按比例混回形成雾状残影，
         # 均匀底色上直接把笔画区（含外晕）整体定成背景色，彻底杜绝残影
         for _fm, _fb in _flat_fills:
