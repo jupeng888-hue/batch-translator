@@ -375,6 +375,18 @@ def _label_stroke_mask(img_bgr, rect, label_col, region_mask, inner=None):
     n, lab, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
     rh, rw = sub.shape[:2]
     keep = np.zeros_like(binary)
+    prot = np.zeros_like(binary)  # 受保护的组件（数字/小数点），膨胀晕也不许覆盖
+    # 顶部数字带判定：inner 上部 15px 内存在独立组件、且下方另有文字行
+    # （质心位于 inner 45% 高度以下）→ 顶部带内容是数字，保护不抹
+    _top_digits = False
+    _below_ch = 0
+    if inner is not None:
+        _ih = inner[3] - inner[1]
+        _bl = [stats[j][3] for j in range(1, n)
+               if stats[j][4] >= 40 and y1 + stats[j][1] + stats[j][3] / 2 > inner[1] + _ih * 0.45]
+        if _bl:
+            _below_ch = max(_bl)
+            _top_digits = True
     for i in range(1, n):
         cx, cy, cw, ch, area = stats[i]
         if area < 6:
@@ -384,18 +396,47 @@ def _label_stroke_mask(img_bgr, rect, label_col, region_mask, inner=None):
         if inner is not None:
             _gy = y1 + cy + ch / 2
             if _gy < inner[1]:
-                continue  # 文字行上方的内容（如标签上部的数字）保留不抹
-        # 圆点状小组件（小数点/句点）保留：笔画组件不会是这么饱满的近似正方形
-        if area <= 150 and 0.5 <= cw / max(1, ch) <= 2.0 and area >= 0.5 * cw * ch:
-            continue
+                prot[lab == i] = 255  # 文字行上方的内容（如标签上部的数字）保留不抹
+                continue
+            if _top_digits and _gy < inner[1] + 15 and ch <= max(16, _below_ch * 0.65):
+                # 真数字与下方文字行之间有明显间隙；文字笔画的顶部碎片与下方笔画
+                # 几乎相连（间隙≤8px 且横向重叠过半），不误保护
+                _separated = True
+                for j in range(1, n):
+                    if j == i:
+                        continue
+                    cx2, cy2, cw2, ch2, area2 = stats[j]
+                    _gap = cy2 - (cy + ch)
+                    _ovl = min(cx + cw, cx2 + cw2) - max(cx, cx2)
+                    if -2 <= _gap <= 8 and _ovl > min(cw, cw2) * 0.5:
+                        _separated = False
+                        break
+                if _separated:
+                    prot[lab == i] = 255  # 顶部数字带（如 15.6 与文字同框时）保留不抹
+                    continue
+            # 小数点保护：顶部数字带（inner 上缘起 15px 内）的圆点状小组件，
+            # 且同一水平带存在 ≥2 个明显更大的组件（数字）→ 判定为小数点保留；
+            # 中文偏旁点（氵等）位于文字行内，不在顶部数字带，不会被误保护
+            if area <= 150 and 0.5 <= cw / max(1, ch) <= 2.0 and area >= 0.5 * cw * ch \
+                    and _gy < inner[1] + 15:
+                _lcy = cy + ch / 2
+                _big = 0
+                for j in range(1, n):
+                    if j == i:
+                        continue
+                    cx2, cy2, cw2, ch2, area2 = stats[j]
+                    if area2 >= area * 3 and abs(cy2 + ch2 / 2 - _lcy) <= max(ch, ch2):
+                        _big += 1
+                if _big >= 2:
+                    prot[lab == i] = 255
+                    continue
         keep[lab == i] = 255
     if int(keep.sum()) < 200:
         return region_mask
-    keep = cv2.dilate(keep, np.ones((7, 7), np.uint8))
-    if inner is not None:
-        # 裁剪到文字行上缘以下：膨胀晕不许侵入文字行上方（数字/小数点区域）
-        _cut = max(0, inner[1] + 15 - y1)
-        keep[:_cut, :] = 0
+    keep = cv2.dilate(keep, np.ones((11, 11), np.uint8))
+    if int(prot.sum()) > 0:
+        # 膨胀晕精确避开受保护组件（按组件轮廓而非整行裁剪，避免误伤文字笔画顶部）
+        keep[cv2.dilate(prot, np.ones((7, 7), np.uint8)) > 0] = 0
     out = np.zeros_like(region_mask)
     out[y1:y2, x1:x2] = keep
     return out
@@ -505,6 +546,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
     try:
         h, w = img_bgr.shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
+        _stroke_union = np.zeros((h, w), dtype=np.uint8)
         _unis = []
         _flat_fills = []
         for box in boxes:
@@ -528,8 +570,11 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 (lx1, ly1, lx2, ly2), lcol = label
                 box_mask = np.zeros_like(mask)
                 box_mask[ly1:ly2, lx1:lx2] = 255
-                mask |= _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask,
-                                           inner=(ux1, uy1, ux2, uy2))
+                _lsm = _label_stroke_mask(img_bgr, (lx1, ly1, lx2, ly2), lcol, box_mask,
+                                          inner=(ux1, uy1, ux2, uy2))
+                mask |= _lsm
+                # 标签笔画不走 Telea：白字边缘未盖全时 Telea 会把高光扩散成雾状残字，
+                # 标签底色单纯，交给 LaMa 语义填充更干净
                 continue
             if uni >= 0.5:
                 if fl < 110 and bl > 140:
@@ -546,15 +591,23 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 _sm = _stroke_mask(img_bgr, (x1, y1, x2, y2), box_mask, k=stroke_k, fg=_fg_e,
                                    inner=(ux1, uy1, ux2, uy2))
                 mask |= _sm
+                _stroke_union |= _sm
                 # 高均匀浅底：LaMa 容易留雾状残影，记下mask稍后按背景色平涂
                 if uni >= 0.65 and _luminance(_bg_e) > 200:
                     _flat_fills.append((_sm, _bg_e))
             else:
                 _unis.append(uni)
                 mask[y1:y2, x1:x2] = 255
-        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        out = cv2.cvtColor(np.array(lama(Image.fromarray(rgb), Image.fromarray(mask))), cv2.COLOR_RGB2BGR)
-        out = out[:h, :w]  # SimpleLama 内部会把尺寸对齐到 8 的倍数，裁剪回原尺寸
+        # 混合修复：笔画级 mask 用 Telea 沿边缘方向扩散填充（保住纹理/交界锐度；
+        # LaMa 在这类结构背景上会把交界糊成雾斑）。整块 mask（照片背景大面积缺失）
+        # 仍用 LaMa，避免 Telea 在大区域上留涂抹痕。
+        out = cv2.inpaint(img_bgr, mask, 5, cv2.INPAINT_TELEA)
+        _mask_lama = mask & ~cv2.dilate(_stroke_union, np.ones((9, 9), np.uint8))
+        if int((_mask_lama > 0).sum()) > 0:
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            _lout = cv2.cvtColor(np.array(lama(Image.fromarray(rgb), Image.fromarray(_mask_lama))), cv2.COLOR_RGB2BGR)
+            _lout = _lout[:h, :w]  # SimpleLama 内部会把尺寸对齐到 8 的倍数，裁剪回原尺寸
+            out[_mask_lama > 0] = _lout[_mask_lama > 0]
         # 二次抹除：照片/渐变背景上 LaMa 可能留下淡淡的笔画回声，
         # 在修复结果上重新检测一遍残余笔画，有则再抹一次
         try:
@@ -600,9 +653,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
                 _reg2[y1:y2, x1:x2] = _echo
                 mask2 |= _reg2
             if int((mask2 > 0).sum()) > 300:
-                rgb2 = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-                out = cv2.cvtColor(np.array(lama(Image.fromarray(rgb2), Image.fromarray(mask2))), cv2.COLOR_RGB2BGR)
-                out = out[:h, :w]
+                out = cv2.inpaint(out, mask2, 5, cv2.INPAINT_TELEA)  # 残影均为细笔画，Telea 即可
                 mask = cv2.bitwise_or(mask, mask2)
                 log("[图片] 检测到笔画残影，已二次抹除")
         except Exception:
@@ -614,13 +665,18 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print):
         m = mask.astype(np.float32) / 255.0
         m = cv2.dilate(m, np.ones((13, 13), np.uint8))  # 保证文字区完全不透原图
         m = cv2.GaussianBlur(m, (0, 0), 8)
-        # 修复区整体柔化仅在照片类复杂背景下启用（模拟焦外虚化遮 LaMa 色带）；
-        # 浅色均匀背景上启用反而把邻近图标/线条糊成雾斑
+        # 修复区柔化仅在照片类复杂背景下启用，且只作用于遮罩边缘过渡带
+        # （整体 σ5 柔化会把修复区内的纹理/边缘——如毛衣与背景的交界——糊成雾斑）
         if _unis and min(_unis) < 0.5:
-            out_soft = cv2.GaussianBlur(out, (0, 0), 5)
+            _soft = cv2.GaussianBlur(out, (0, 0), 5)
+            _core = cv2.erode(m, np.ones((25, 25), np.uint8))  # 修复区内部：保留 LaMa 锐度
+            _band = np.clip(m - _core, 0.0, 1.0)               # 仅边缘过渡带柔化
+            _band = cv2.GaussianBlur(_band, (0, 0), 6)
+            out_soft = (out.astype(np.float32) * (1.0 - _band[..., None])
+                        + _soft.astype(np.float32) * _band[..., None])
         else:
-            out_soft = out
-        res = out_soft.astype(np.float32) * m[..., None] + img_bgr.astype(np.float32) * (1.0 - m[..., None])
+            out_soft = out.astype(np.float32)
+        res = out_soft * m[..., None] + img_bgr.astype(np.float32) * (1.0 - m[..., None])
         res = res.astype(np.uint8)
         # 高均匀浅底二次定色：羽化环会把原图文字边缘按比例混回形成雾状残影，
         # 均匀底色上直接把笔画区（含外晕）整体定成背景色，彻底杜绝残影
