@@ -969,7 +969,8 @@ def _luminance(bgr):
 def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
                     left_limit=None, right_limit=None, tight=False, orig_bgr=None,
                     top_limit=None, bottom_limit=None, allow_widen=True,
-                    label_mode=False, force_size=None, probe=False, force_bold=None):
+                    label_mode=False, force_size=None, probe=False, force_bold=None,
+                    dark_roomy=False):
     """在矩形区域内回填译文：允许水平适度扩展，优先单行、贴近原字号。
     自动加描边（浅色文字配深描边、深色文字配浅描边），提升复杂背景可读性。"""
     x1, y1, x2, y2 = rect
@@ -1106,7 +1107,13 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
     # 短句单行优先：一行能放下时尽量不换行；≤4 词的短句放宽字号损失容忍度
     # 标签模式（彩色小标签）除外：译文长、标签小，强制单行会缩到看不清，
     # 允许两行换取显著更大的字号
-    if single is not None and len(lines) > 1 and not label_mode:
+    if dark_roomy and single is not None and len(lines) > 1:
+        # 白字深底空旷区：与标签同理，拒绝"单行 9px"式缩小，
+        # 单行字号达不到多行方案的 75% 就保留更大的多行字
+        s_font, s_lines, s_lh, s_th, s_size = single
+        if s_size >= font.size * 0.75:
+            font, lines, line_h, total_h = s_font, s_lines, s_lh, s_th
+    if single is not None and len(lines) > 1 and not label_mode and not dark_roomy:
         s_font, s_lines, s_lh, s_th, s_size = single
         # ≤3 词短句：只要能挤进一行就不断行（字号可降到下限）
         thresh = 0.30 if n_words <= 3 else (0.40 if n_words <= 4 else 0.65)
@@ -1121,7 +1128,8 @@ def draw_text_block(img_pil, rect, text, fg_bgr, expand=1.35, margin=8,
             font, lines, line_h, total_h = s_font, s_lines, s_lh, s_th
 
     # 最终保险：单行译文宽度不超出原框，避免压到装饰边框/框外区域
-    if len(lines) == 1:
+    # （dark_roomy 深底空旷区豁免：扩展宽度换取字号正是目的，且受邻框限制保护）
+    if len(lines) == 1 and not dark_roomy:
         lw1 = draw.textlength(lines[0], font=font)
         if lw1 > orig_w:
             for size in range(font.size - 1, 8, -1):
@@ -1247,6 +1255,12 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
         # 平滑背景（彩色标签/徽标）：文字必须留在原框内，不外扩
         # 复杂背景（照片区域）：允许适度外扩
         expand = 1.05 if smooth else 1.35
+        # 白字压深色照片底（包内衬/深色场景）：深色区域通常空旷，长译文按 1.35 外扩
+        # 会缩得过小看不清，加大水平外扩换取更大字号（仍受邻框左右限制保护）
+        _fg_d, _bg_d = _estimate_colors(orig_bgr, rect)
+        _dark_roomy = not smooth and _luminance(_bg_d) < 140 and _luminance(_fg_d) > 170
+        if _dark_roomy:
+            expand = 1.9
         # 检测到装饰边框（描边圆角框等）：译文锁定在边框内部，不压框不越界
         allow_widen = True
         _fg_b, _bg_b = _estimate_colors(orig_bgr, rect)
@@ -1279,16 +1293,19 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
                 x1, y1, x2, y2 = rect
                 expand = 1.0
                 allow_widen = False
+        if _label is not None or border is not None:
+            _dark_roomy = False  # 标签/边框内锁框渲染，不适用深底放大规则
         _size = draw_text_block(img_pil, rect, dst_text, fg, expand=expand,
                                 left_limit=left_limit, right_limit=right_limit,
                                 orig_bgr=orig_bgr, tight=True,
                                 top_limit=top_limit, bottom_limit=bottom_limit,
-                                allow_widen=allow_widen,
+                                allow_widen=allow_widen, dark_roomy=_dark_roomy,
                                 label_mode=_label is not None, probe=True)
         _jobs.append(dict(rect=rect, dst=dst_text, fg=fg, expand=expand,
                           left_limit=left_limit, right_limit=right_limit,
                           top_limit=top_limit, bottom_limit=bottom_limit,
                           allow_widen=allow_widen, label_mode=_label is not None,
+                          dark_roomy=_dark_roomy,
                           size=_size if isinstance(_size, int) else None,
                           bold=_estimate_bold(orig_bgr, rect, fg) if orig_bgr is not None else False,
                           cy=(rect[1] + rect[3]) / 2, bh=rect[3] - rect[1]))
@@ -1380,6 +1397,7 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
                                       orig_bgr=orig_bgr, tight=True,
                                       top_limit=jb["top_limit"], bottom_limit=jb["bottom_limit"],
                                       allow_widen=jb["allow_widen"],
+                                      dark_roomy=jb["dark_roomy"],
                                       label_mode=jb["label_mode"], probe=True)
                 if isinstance(_ns, int) and _ns > jb["size"]:
                     jb["size"] = _ns
@@ -1403,6 +1421,7 @@ def translate_image(image_path, output_path, target, engine=None, log=print):
                                   top_limit=jb["top_limit"], bottom_limit=jb["bottom_limit"],
                                   allow_widen=jb["allow_widen"],
                                   label_mode=jb["label_mode"],
+                                  dark_roomy=jb["dark_roomy"],
                                   force_size=_forced[j], force_bold=_fbold[j])
 
     out_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
