@@ -607,6 +607,32 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
                 _pk = cv2.dilate(_pk, np.ones((7, 7), np.uint8))
                 m[_py1:_py2, _px1:_px2][_pk > 0] = 0
             return m
+        # 图形保护：箭头/手绘装饰等纯黑图形常与文字框相邻甚至伸进膨胀框，会被
+        # 当笔画抹掉。文字笔画必然落在某个文字框内；大块深色连通块若大部分位于
+        # 所有文字框之外，即为图形，从抹除掩膜中剔除。
+        _boxes_d = np.zeros((h, w), dtype=np.uint8)
+        for _b in boxes:
+            _bp = np.asarray(_b, dtype=np.float64).reshape(-1, 2)
+            _bx1 = max(0, int(_bp[:, 0].min()) - dilate)
+            _by1 = max(0, int(_bp[:, 1].min()) - dilate)
+            _bx2 = min(w, int(_bp[:, 0].max()) + dilate)
+            _by2 = min(h, int(_bp[:, 1].max()) + dilate)
+            _boxes_d[_by1:_by2, _bx1:_bx2] = 1
+        _dark_all = (cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) < 60).astype(np.uint8)
+        _gn, _glab, _gst, _ = cv2.connectedComponentsWithStats(_dark_all, 8)
+        _graphic_px = np.zeros((h, w), dtype=bool)
+        for _gi in range(1, _gn):
+            _ga = _gst[_gi, 4]
+            if _ga < 200:
+                continue
+            _comp = _glab == _gi
+            if float((_boxes_d[_comp] > 0).sum()) / _ga < 0.5:
+                _graphic_px |= _comp
+
+        def _protect_graphics(m):
+            if _graphic_px.any():
+                m[_graphic_px] = 0
+            return m
         _stroke_union = np.zeros((h, w), dtype=np.uint8)
         _tight_union = np.zeros((h, w), dtype=np.uint8)
         _rebuild_union = np.zeros((h, w), dtype=np.uint8)
@@ -645,16 +671,21 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
                 continue
             _tight = False
             if uni >= 0.5:
-                if fl < 110 and bl > 140:
-                    stroke_k = 13   # 深字浅底：笔画抹除，膨胀加大盖住半透明残边
+                if fl < 110 and bl > 235:
+                    stroke_k = 13   # 深字近白底：笔画抹除，膨胀加大盖住半透明残边
+                elif fl < 110 and bl > 140:
+                    # 底色被框内纹理/图案拉灰（140<bl≤235，如跨白条+碎石+衣物的
+                    # 标题）：均匀度估计已被污染不可信，按混合底收紧抹除并交 LaMa
+                    stroke_k = 13
+                    _tight = True
                 elif fl > 170:
                     stroke_k = 15   # 白字：连阴影/描边一起抹
             elif fl > 170 and bl < 140:
                 # 白字压深色照片背景：整块抹除会留污斑，改用笔画抹除
                 stroke_k = 15
-            elif fl < 110 and bl > 235:
-                # 近白主底但框内混入碎石/图案（uni<0.5，如斑马线条带上的标题）：
-                # 整块 LaMa 会把条带与碎石的交界糊成雾斑，改笔画级抹除；
+            elif fl < 110:
+                # 深字混合底（uni<0.5，如斑马线条带/碎石/衣物同框的标题）：整块 LaMa
+                # 会把条带与碎石的交界糊成雾斑，一律笔画级抹除；
                 # tight 收紧亮度阈值，防止中灰碎石斑点被误当笔画抹成白点
                 stroke_k = 13
                 _tight = True
@@ -668,6 +699,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
                 # _flat_fills/_stroke_union 用于平涂——不过保护会把伸进膨胀框的
                 # 受保护文字（如标题下方的橙色英文行）抹掉再涂成底色
                 _sm = _apply_protect(_sm)
+                _sm = _protect_graphics(_sm)
                 mask |= _sm
                 _stroke_union |= _sm
                 if _tight:
@@ -723,8 +755,18 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
         # LaMa 在这类结构背景上会把交界糊成雾斑）。整块 mask（照片背景大面积缺失）
         # 仍用 LaMa，避免 Telea 在大区域上留涂抹痕。
         mask = _apply_protect(mask)
+        mask = _protect_graphics(mask)
+        import os as _os
+        _dbg = _os.environ.get('ERASE_DEBUG')
+        if _dbg:
+            cv2.imwrite(_dbg + '_mask.png', mask)
         out = cv2.inpaint(img_bgr, mask, 5, cv2.INPAINT_TELEA)
-        _mask_lama = mask & ~cv2.dilate(_stroke_union, np.ones((9, 9), np.uint8))
+        if _dbg:
+            cv2.imwrite(_dbg + '_telea.jpg', out)
+        # 纹理混合底（tight）的笔画交给 LaMa：AI 能合成出与周围一致的碎石/纹理，
+        # Telea 在粗笔画上只会涂出灰云；均匀底的笔画仍走 Telea（保色稳、防漂移）
+        _stroke_keep_telea = _stroke_union & ~_tight_union
+        _mask_lama = mask & ~cv2.dilate(_stroke_keep_telea, np.ones((9, 9), np.uint8))
         if int((_mask_lama > 0).sum()) > 0:
             rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             _lout = cv2.cvtColor(np.array(lama(Image.fromarray(rgb), Image.fromarray(_mask_lama))), cv2.COLOR_RGB2BGR)
@@ -750,6 +792,9 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
                                   - cv2.blur(_g0.astype(np.float32), (21, 21)) ** 2))
             _need0 = cv2.dilate(((_tight_union > 0)).astype(np.uint8),
                                 np.ones((45, 45), np.uint8)) > 0  # 连笔画光晕一起重建
+            # 已由 LaMa 填充的笔画区不得再供体覆盖——LaMa 合成的纹理与周围一致，
+            # 随机供体反而会把白斑撒进去；只留笔画外的光晕环做重建
+            _need0 &= ~(cv2.dilate(_mask_lama, np.ones((9, 9), np.uint8)) > 0)
             # 近白实心条带（亮度>235 闭运算大连通块）不重建——白条上的淡晕不明显，
             # 且白条供体（纸纹）与纹理供体不能混
             _cand = (_g0 > 235).astype(np.uint8)
@@ -771,6 +816,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
             _ctx2 = cv2.erode(cv2.blur(_mod.astype(np.float32), (41, 41)),
                               np.ones((81, 81), np.uint8))
             _rng = np.random.default_rng(7)
+            _sat0 = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)[..., 1]
             _yy, _xx = np.mgrid[0:h, 0:w]
             _filled = np.zeros((h, w), bool)
             for _attempt in range(16):  # 多轮随机供体：单轮命中率低，逐轮补满
@@ -785,13 +831,20 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
                 _inb = (_yy + _oy >= 0) & (_yy + _oy < h) & (_xx + _ox >= 0) & (_xx + _ox < w)
                 _dy = np.clip(_yy + _oy, 0, h - 1)
                 _dx = np.clip(_xx + _ox, 0, w - 1)
-                # 供体亮度匹配：以 81px 腐蚀后的干净底色为基准（光晕污染不了）
+                # 供体亮度匹配：以 81px 腐蚀后的干净底色为基准（光晕污染不了）；
+                # 饱和度守卫：彩色像素（橙色笔画/绿色装饰，灰度亮度可能与碎石相近）
+                # 不得作供体，否则灰云里会撒进彩色斑点
                 _ok = _todo & _inb & (_occ[_dy, _dx] == 0) & (_ls[_dy, _dx] > 12) \
+                      & (_sat0[_dy, _dx] < 60) \
                       & (np.abs(_lm[_dy, _dx] - _ctx2) < 35) \
                       & ((_ctx2 < 235) | (_lm[_dy, _dx] > 225))  # 亮区只配亮供体
                 if _ok.any():
                     out[_ok] = img_bgr[_dy[_ok], _dx[_ok]]
                     _filled |= _ok
+            if _dbg:
+                cv2.imwrite(_dbg + '_need0.png', (_need0.astype(np.uint8)) * 255)
+                cv2.imwrite(_dbg + '_filled.png', (_filled.astype(np.uint8)) * 255)
+                cv2.imwrite(_dbg + '_rebuilt.jpg', out)
             if _filled.any():
                 _tmp = cv2.medianBlur(out, 3)  # 轻度融合块缝
                 out[_filled] = _tmp[_filled]
@@ -890,6 +943,7 @@ def erase_text_lama(img_bgr, boxes, dilate=10, log=print, protect=None):
                 mask2 |= _reg2
             if int((mask2 > 0).sum()) > 300:
                 mask2 = _apply_protect(mask2)
+                mask2 = _protect_graphics(mask2)
                 out = cv2.inpaint(out, mask2, 5, cv2.INPAINT_TELEA)  # 残影均为细笔画，Telea 即可
                 mask = cv2.bitwise_or(mask, mask2)
                 log("[图片] 检测到笔画残影，已二次抹除")
