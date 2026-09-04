@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt, QTimer
 from core.batch import run_batch
 from core.translate_engine import SUPPORTED_TARGETS, _read_config_key, save_config_key
 
-APP_TITLE = "批量翻译工具 v1.7.1（中文 → 14 种主流语言）"
+APP_TITLE = "批量翻译工具 v1.7.2（中文 → 14 种主流语言）"
 
 
 def _write_debug_log(msg):
@@ -260,6 +260,10 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # PyInstaller 打包版必须声明 freeze_support：内部库（whisper/torch 等）spawn
+    # 子进程时会重跑 exe，没有这一句子进程会把整个 GUI 再启动一遍
+    import multiprocessing
+    multiprocessing.freeze_support()
     # 未捕获异常弹窗显示，杜绝"点了没反应"
     import traceback
     def _excepthook(cls, exc, tb):
