@@ -11,8 +11,9 @@ from .translate_engine import TranslateEngine, SUPPORTED_TARGETS
 from .image_translate import translate_image
 from .video_translate import translate_video
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp",
+              ".avif", ".heic", ".heif", ".tif", ".tiff"}  # 电商下载图常见 jfif/avif/heic
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".ts", ".flv", ".wmv"}
 
 
 def scan_media(input_dir):
