@@ -43,6 +43,15 @@ def run_batch(input_dir, output_dir, targets,
     cancel_check: 返回 True 表示用户取消
     """
     images, videos = scan_media(input_dir)
+    log(f"[批量] 扫描完成：图片 {len(images)} 张、视频 {len(videos)} 个，目标语言 {len(targets)} 种")
+    if not images and not videos:
+        try:
+            _all = []
+            for _r, _d, _fs in os.walk(input_dir):
+                _all.extend(_fs)
+            log(f"[批量] 文件夹内实际文件（前 20 个）：{', '.join(_all[:20]) or '（空）'}")
+        except Exception:
+            pass
     tasks = []
     if do_images:
         tasks += [("image", x) for x in images]

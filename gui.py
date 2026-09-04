@@ -19,7 +19,21 @@ from PySide6.QtCore import Qt, QTimer
 from core.batch import run_batch
 from core.translate_engine import SUPPORTED_TARGETS, _read_config_key, save_config_key
 
-APP_TITLE = "批量翻译工具 v1.7（中文 → 14 种主流语言）"
+APP_TITLE = "批量翻译工具 v1.7.1（中文 → 14 种主流语言）"
+
+
+def _write_debug_log(msg):
+    """所有日志同时写一份到 exe 旁的调试文件，界面异常时也能排查。"""
+    try:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(base, "BatchTranslator_运行日志.txt"), "a", encoding="utf-8") as f:
+            import datetime
+            f.write("[%s] %s\n" % (datetime.datetime.now().strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
 
 
 class MainWindow(QMainWindow):
@@ -200,14 +214,17 @@ class MainWindow(QMainWindow):
 
         def work():
             try:
+                log(f"[批量] 任务线程已启动，导入目录：{input_dir}")
                 run_batch(input_dir, output_dir, targets,
                           do_images=self.cb_img.isChecked(),
                           do_videos=self.cb_vid.isChecked(),
                           keep_background=self.cb_bg.isChecked(),
                           cover_original=self.cb_cover.isChecked(),
                           log=log, progress=progress, cancel_check=cancel_check)
-            except Exception as e:
-                log(f"[错误] {e}")
+            except BaseException as e:  # SystemExit/MemoryError 等也不能静默
+                import traceback
+                log(f"[错误] {type(e).__name__}: {e}")
+                _write_debug_log(traceback.format_exc())
             finally:
                 self._log_queue.put("__FINISHED__")
 
@@ -237,6 +254,7 @@ class MainWindow(QMainWindow):
 
     def _log(self, msg):
         self.log_view.appendPlainText(msg)
+        _write_debug_log(msg)
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
